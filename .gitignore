@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual env
+ai/
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+Desktop.ini
+
+# Training data/cache (large files)
+E:/training/
+data_cache.npy
+*.npy
+
+# Opencode sessions
+session-ses*.md
+opencode-session*.md
+
+# Logs
+*.log
+errors.log
+run_hash.txt
+gpt*.json
+dataset*.json

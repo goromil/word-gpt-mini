@@ -1,0 +1,42 @@
+{
+  "torrents": [
+    {
+      "magnet": "http://files.chitanka.info/chitanka.01.04.2016.torrent",
+      "label": "chitanka-2016",
+      "description": "Читалня пълна база — ~11K художествена литература, 673 детски, 171 приказки"
+    }
+  ],
+  "api": [
+    {
+      "name": "chitanka-xml",
+      "base_url": "http://chitanka.info/texts/search.xml",
+      "queries": [
+        { "q": "приказка", "by": "title", "match": "prefix", "min_size": 1, "max_size": 100 },
+        { "q": "басня", "by": "title", "match": "prefix", "min_size": 1, "max_size": 100 },
+        { "q": "разказ", "by": "title", "match": "prefix", "min_size": 1, "max_size": 100 },
+        { "q": "смехурко", "by": "title", "match": "prefix", "min_size": 1, "max_size": 100 },
+        { "q": "сръчко", "by": "title", "match": "prefix", "min_size": 1, "max_size": 100 },
+        { "q": "грам", "by": "title", "match": "prefix", "min_size": 1, "max_size": 100 },
+        { "q": "гатанк", "by": "title", "match": "prefix", "min_size": 1, "max_size": 100 },
+        { "q": "стихотворение", "by": "title", "match": "prefix", "min_size": 1, "max_size": 100 },
+        { "q": "баща ми", "by": "title", "match": "prefix", "min_size": 1, "max_size": 100 },
+        { "q": "детски", "by": "title", "match": "prefix", "min_size": 1, "max_size": 100 }
+      ]
+    }
+  ],
+  "settings": {
+    "output_dir": "E:\\training\\data2",
+    "download_dir": "E:\\training\\data2\\downloads",
+    "extract_dir": "E:\\training\\data2\\extracted",
+    "max_workers": 4,
+    "hf_token_file": null,
+    "min_text_length": 50,
+    "max_text_length": 4096,
+    "languages": ["bg", "ru", "mk", "de", "fr", "es", "it", "pl"],
+    "output_format": "txt",
+    "max_file_size_mb": 2048,
+    "split_long_lines": true,
+    "min_size_kb": 1,
+    "max_size_kb": 100
+  }
+}
