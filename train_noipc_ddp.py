@@ -244,7 +244,9 @@ class Trainer:
         self.ckpt_interval = train_cfg.get("checkpoint_interval", 0)
         self.ckpt_every_min = train_cfg.get("checkpoint_every_min", 0)
         self.ckpt_every = train_cfg.get("checkpoint_every", 1)
-        self.grad_accum = train_cfg.get("gradient_accumulation_steps", 1)
+        sync_cfg = train_cfg.get("sync", {})
+        self.grad_accum = sync_cfg.get("gradient_accumulation_steps",
+                      train_cfg.get("gradient_accumulation_steps", 1))
         self.use_bf16 = torch.cuda.is_bf16_supported()
         self.log_interval = train_cfg.get("log_interval", 100)
 

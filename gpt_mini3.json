@@ -9,10 +9,12 @@
     "epochs": 31,
     "batch_size": 8,
     "lr": 0.0002,
-    "gradient_accumulation_steps": 8,
     "checkpoint_every": 6,
     "checkpoint_interval": 10000,
-    "checkpoint_every_min": 30
+    "checkpoint_every_min": 30,
+    "sync": {
+      "gradient_accumulation_steps": 8
+    }
   },
   "tokenizer": {
     "max_vocab_size": 32768,
