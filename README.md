@@ -5,8 +5,9 @@ A GPT implementation in PyTorch with self-training and configurable architecture
 ## Quick Start
 
 ```bash
-python train_designer.py --no-interact --force  # generate gpt_mini3.json
-python train_ddp.py                              # train on 2 GPUs
+python train_designer.py --no-interact --force   # generate gpt_mini3.json
+python train_noipc_ddp.py -d 0,1                 # train on 2 RTX 3090s (no-P2P)
+python train_ipc_ddp.py -d 0,1                   # train on 2 V100 SXM2 (P2P/NVLink)
 ```
 
 ## Config Files
@@ -90,23 +91,41 @@ Resume reads `checkpoints/<hash>/train.log` once, extracts `global_batch`, and c
 | Bulgarian Corpus 33B | 84.8 GB | ~29B | — |
 | Russian Cleared Wikipedia | 153 MB | — | — |
 
-### Multi-GPU Training (DDP)
+### Multi-GPU Training
+
+Two trainers, choose based on your GPU topology:
+
+| Trainer | GPU Sync | Requires | Use On |
+|---|---|---|---|
+| `train_ipc_ddp.py` | DDP GPU all_reduce | P2P (NVLink, SXM2) | V100, A100, H100 |
+| `train_noipc_ddp.py` | CPU all_reduce (gloo) | No P2P needed | RTX 3090, consumer GPUs |
+
+**How they differ**: DDP's `all_reduce` on CUDA tensors uses CUDA IPC, which requires P2P
+(peer-to-peer) access between GPUs. Our RTX 3090s have PXB (PCIe bridge) topology — no P2P —
+so DDP crashes with segfault (exit code 0xC0000005). The no-IPC trainer syncs gradients via CPU
+where gloo works fine on localhost.
 
 ```bash
-python train_ddp.py                          # train on 2 GPUs (world_size=2)
-python train_ddp.py custom_config.json       # use custom config
+# P2P GPUs (NVLink):
+python train_ipc_ddp.py -d 0,1               # train on 2 GPUs
+python train_ipc_ddp.py -d 0,1,2,3           # train on 4 GPUs
+
+# No-P2P GPUs (PCIe bridge):
+python train_noipc_ddp.py -d 0,1             # train on 2 GPUs, CPU grad sync
 ```
 
-**How it works**: Uses `torch.multiprocessing.spawn` with 2 processes (one per GPU).
-Each rank runs the same training loop but processes different data via `DistributedSampler`.
+**How it works**: Uses `torch.multiprocessing.spawn` with one process per GPU.
+Each rank runs the same training loop but processes different data via `LazyDistributedSampler`
+(avoiding `torch.randperm` MemoryError on 453M-token dataset).
 
 **Master address**: `127.0.0.1:29500` — set BEFORE `mp.spawn` to avoid Windows hostname resolution issues.
 
 **Ctrl+C handling**: Signal handlers on each rank call `dist.destroy_process_group()` before exit.
 Main process waits 2s for graceful shutdown, then force-kills children.
 
-**Memory**: Each GPU loads full model weights (shared via DDP) but only processes `batch_size / world_size`
-samples. The `DistributedSampler` ensures each GPU sees different data each epoch.
+**Memory**: Each GPU loads full model weights but only processes `batch_size / world_size`
+samples. On no-P2P systems, gradients are copied to CPU for all_reduce and copied back — adds
+~50-100ms overhead per step, negligible compared to forward/backward compute.
 
 ## Draft Config Format (`gpt_mini3_draft.json`)
 

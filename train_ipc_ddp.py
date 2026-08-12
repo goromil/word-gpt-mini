@@ -1,12 +1,13 @@
 """
-Multi-GPU DDP trainer following PyTorch tutorial pattern:
-  https://docs.pytorch.org/tutorials/beginner/ddp_series_multigpu.html
+Multi-GPU DDP trainer for NVLink/P2P GPUs (requires CUDA IPC).
+Requires P2P topology between GPUs (e.g. V100 SXM2, A100, H100).
+Will NOT work on PCIe-bridge GPUs like RTX 3090 (use train_noipc_ddp.py).
 
 Usage:
-    python train_ddp.py                          # all CUDA GPUs, default config
-    python train_ddp.py -d 0,1                   # GPUs 0 and 1
-    python train_ddp.py -d 0 gpt_mini3.json      # GPU 0 only, custom config
-    python train_ddp.py --epochs 10 --save_every 3
+    python train_ipc_ddp.py                          # all CUDA GPUs, default config
+    python train_ipc_ddp.py -d 0,1                   # GPUs 0 and 1
+    python train_ipc_ddp.py -d 0 gpt_mini3.json      # GPU 0 only, custom config
+    python train_ipc_ddp.py --epochs 10 --save_every 3
 """
 import os, sys, json, time, hashlib
 from pathlib import Path
@@ -14,7 +15,7 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from torch.utils.data.distributed import DistributedSampler
+from torch.utils.data import Sampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from gpt_mini3 import (
@@ -41,8 +42,8 @@ def ddp_setup(rank: int, world_size: int, device: int, master_port: str):
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = master_port
 
-    # NCCL not compiled on Windows PyTorch wheel -> use gloo
-    backend = "gloo"
+    # Prefer NCCL for NVLink/P2P GPUs, fall back to gloo
+    backend = "nccl" if dist.is_nccl_available() else "gloo"
     try:
         dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
     except RuntimeError as e:
@@ -50,8 +51,12 @@ def ddp_setup(rank: int, world_size: int, device: int, master_port: str):
             raise RuntimeError(f"Backend '{backend}' not compiled. Install torch with NCCL support or use gloo.") from e
         raise
 
+    has_p2p = torch.cuda.can_device_access_peer(device, (device + 1) % 2)
     print(f"Rank {rank} -> cuda:{device} | {torch.cuda.get_device_name(device)}  "
-          f"(world_size={world_size})")
+          f"(world_size={world_size}, backend={backend}, P2P={has_p2p})")
+    if not has_p2p:
+        print(f"WARNING: No P2P between GPUs! DDP will crash. Use train_noipc_ddp.py instead.",
+              flush=True)
 
 
 # =============================================================================
@@ -147,15 +152,36 @@ def load_train_objs(tokenizer, dataset, model_cfg, device):
 
 
 # =============================================================================
-# 3. PREPARE DATALOADER  (per tutorial)
+# 3. LAZY DISTRIBUTED SAMPLER  (no randperm, no MemoryError)
 # =============================================================================
-def prepare_dataloader(dataset, batch_size: int):
+class LazyDistributedSampler(Sampler):
+    """Yield indices for one rank without materializing a full permutation array."""
+    def __init__(self, dataset_len, rank=0, world_size=1, batch_size=1):
+        self.dataset_len = dataset_len
+        self.rank = rank
+        self.world_size = world_size
+        self.batch_size = batch_size
+        self.total = (dataset_len // (batch_size * world_size)) * (batch_size * world_size)
+
+    def __iter__(self):
+        for i in range(self.rank, self.total, self.world_size):
+            yield i
+
+    def __len__(self):
+        return (self.total + self.world_size - 1) // self.world_size
+
+    def set_epoch(self, epoch):
+        pass
+
+
+def prepare_dataloader(dataset, batch_size: int, rank: int, world_size: int):
     """
-    DistributedSampler chunks input data across all processes.
+    LazyDistributedSampler avoids torch.randperm(453M) MemoryError.
     Each process gets batch_size samples; effective batch = batch_size * nprocs.
     """
     from torch.utils.data import DataLoader
-    sampler = DistributedSampler(dataset, shuffle=True)
+    sampler = LazyDistributedSampler(len(dataset), rank=rank, world_size=world_size,
+                                      batch_size=batch_size)
     return DataLoader(dataset, batch_size=batch_size, sampler=sampler, drop_last=True,
                       num_workers=0, pin_memory=False), sampler
 
@@ -399,7 +425,7 @@ def run_ddp(rank: int, world_size: int, devices: tuple, master_port: str, config
     )
 
     # --- Prepare dataloader (per tutorial) ---
-    train_data, sampler = prepare_dataloader(dataset, batch_size)
+    train_data, sampler = prepare_dataloader(dataset, batch_size, rank, world_size)
 
     # --- Build model ---
     model = GPTMini(model_cfg, tokenizer.vocab_size).to(f"cuda:{device}")
