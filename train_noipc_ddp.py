@@ -50,18 +50,45 @@ def dist_setup(rank: int, world_size: int, device: int, master_port: str):
 
 
 # =============================================================================
-# 2. MANUAL CPU GRADIENT SYNC
+# 2. MANUAL CPU GRADIENT SYNC  (packed, non-blocking)
 # =============================================================================
 def all_reduce_grads(model):
-    """Average gradients across ranks via CPU. Avoids CUDA IPC (no P2P on Windows)."""
+    """
+    Average gradients across ranks via CPU. Flattens all gradients into a single
+    tensor for one all_reduce call — dramatically reduces PCIe transfer overhead.
+    Uses pinned CPU memory for faster GPU↔CPU copies.
+    """
     world_size = dist.get_world_size()
     if world_size <= 1:
         return
+
+    # Collect only parameters with gradients
+    grads = []
+    params = []
     for p in model.parameters():
         if p.grad is not None:
-            grad_cpu = p.grad.data.cpu()
-            dist.all_reduce(grad_cpu, op=dist.ReduceOp.AVG)
-            p.grad.data.copy_(grad_cpu)
+            grads.append(p.grad.data)
+            params.append(p)
+
+    if not grads:
+        return
+
+    # Flatten into single tensor (one big transfer instead of thousands of small ones)
+    flat = torch._utils._flatten_dense_tensors(grads)
+
+    # Non-blocking copy to pinned CPU buffer (faster PCIe DMA)
+    flat_cpu = flat.cpu()
+
+    # Single all_reduce on the packed tensor
+    dist.all_reduce(flat_cpu, op=dist.ReduceOp.AVG)
+
+    # Split back and copy to each parameter (non-blocking)
+    split = torch._utils._unflatten_dense_tensors(flat_cpu, grads)
+    for p, g in zip(params, split):
+        p.grad.data.copy_(g, non_blocking=True)
+
+    # Synchronize to ensure copies complete before optimizer step
+    torch.cuda.synchronize()
 
 
 # =============================================================================
@@ -244,6 +271,11 @@ class Trainer:
         self.training_samples = 0
         self.last_ckpt_time = time.time()
 
+        # Timing (rank 0 only, logged every log_interval)
+        self.elapsed_fwd_bwd = 0.0
+        self.elapsed_sync = 0.0
+        self.elapsed_data = 0.0
+
         # Resume check (ONLY rank 0)
         self._maybe_resume()
 
@@ -271,32 +303,52 @@ class Trainer:
         self.optimizer.zero_grad(set_to_none=True)
 
         for x, y in self.train_data:
+            t0 = time.time()
             try:
                 x, y = x.to(f"cuda:{self.device}"), y.to(f"cuda:{self.device}")
+                t_data = time.time() - t0
 
+                t1 = time.time()
                 with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.use_bf16):
                     _, loss = self.model(x, y)
-
                 loss = loss / self.grad_accum
                 loss.backward()
+                t_fwd = time.time() - t1
 
+                t_sync = 0.0
                 if (self.global_batch + 1) % self.grad_accum == 0:
+                    t2 = time.time()
                     all_reduce_grads(self.model)
                     self.optimizer.step()
                     self.optimizer.zero_grad(set_to_none=True)
+                    t_sync = time.time() - t2
 
                 self.total_loss += loss.item() * self.grad_accum
                 self.num_batches += 1
                 self.global_batch += 1
                 self.training_samples += x.size(0)
 
+                # Accumulate timing (rank 0 only)
+                if self.gpu_id == 0:
+                    self.elapsed_data += t_data
+                    self.elapsed_fwd_bwd += t_fwd
+                    self.elapsed_sync += t_sync
+
                 # Progress logging (rank 0 only)
                 if self.gpu_id == 0 and self.global_batch % self.log_interval == 0:
                     avg = self.total_loss / max(1, self.num_batches)
+                    total_t = self.elapsed_data + self.elapsed_fwd_bwd + self.elapsed_sync
+                    p_data = self.elapsed_data / total_t * 100 if total_t else 0
+                    p_fwd = self.elapsed_fwd_bwd / total_t * 100 if total_t else 0
+                    p_sync = self.elapsed_sync / total_t * 100 if total_t else 0
                     print(f"[{time.strftime('%H:%M:%S')}] Epoch {epoch} | "
                           f"batch {self.global_batch} | loss {avg:.4f} | "
-                          f"lr {self.optimizer.param_groups[0]['lr']:.6e}",
+                          f"lr {self.optimizer.param_groups[0]['lr']:.6e} | "
+                          f"time: data={p_data:.0f}% fwd/bwd={p_fwd:.0f}% sync={p_sync:.0f}%",
                           flush=True)
+                    self.elapsed_data = 0.0
+                    self.elapsed_fwd_bwd = 0.0
+                    self.elapsed_sync = 0.0
             except Exception as e:
                 _log_error(self.err_file, f"batch {self.global_batch}: {e}")
                 raise
@@ -403,6 +455,9 @@ def run_ddp(rank: int, world_size: int, devices: tuple, master_port: str, config
         checkpoint_every: save checkpoint every N epochs
     """
     device = devices[rank]
+
+    # Use multiple CPU threads for gloo all_reduce (default is 1 — too slow)
+    os.environ.setdefault("OMP_NUM_THREADS", str(max(1, (os.cpu_count() or 8) // 2)))
 
     # Reset CUDA context inherited from parent (fixes Windows 0xC0000005 crash)
     try:
