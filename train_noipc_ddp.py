@@ -50,45 +50,45 @@ def dist_setup(rank: int, world_size: int, device: int, master_port: str):
 
 
 # =============================================================================
-# 2. MANUAL CPU GRADIENT SYNC  (packed, non-blocking)
+# 2. MANUAL CPU GRADIENT SYNC  (flattened + pinned buffer)
 # =============================================================================
+def _build_sync_buffers(model):
+    """Pre-allocate a single flattened pinned CPU buffer (called once at init)."""
+    params = [p for p in model.parameters() if p.requires_grad]
+    total = sum(p.numel() for p in params)
+    dtype = next(model.parameters()).dtype
+    model._sync_flat_cpu = torch.empty(total, dtype=dtype, device='cpu', pin_memory=True)
+    model._sync_params = params
+
 def all_reduce_grads(model):
     """
-    Average gradients across ranks via CPU. Flattens all gradients into a single
-    tensor for one all_reduce call — dramatically reduces PCIe transfer overhead.
-    Uses pinned CPU memory for faster GPU↔CPU copies.
+    Average gradients across ranks via CPU. Flattens all gradients into one
+    tensor for a single all_reduce call (much faster than per-param sync).
     """
     world_size = dist.get_world_size()
     if world_size <= 1:
         return
 
-    # Collect only parameters with gradients
-    grads = []
-    params = []
-    for p in model.parameters():
-        if p.grad is not None:
-            grads.append(p.grad.data)
-            params.append(p)
+    params = model._sync_params
+    flat_buf = model._sync_flat_cpu
 
-    if not grads:
-        return
-
-    # Flatten into single tensor (one big transfer instead of thousands of small ones)
+    # Flatten gradients on GPU (fast in-place concat)
+    grads = [p.grad.data for p in params]
     flat = torch._utils._flatten_dense_tensors(grads)
 
-    # Non-blocking copy to pinned CPU buffer (faster PCIe DMA)
-    flat_cpu = flat.cpu()
+    # Non-blocking copy to pinned CPU buffer
+    flat_buf[:flat.numel()].copy_(flat, non_blocking=True)
+
+    # Wait for GPU→CPU transfer to complete
+    torch.cuda.synchronize()
 
     # Single all_reduce on the packed tensor
-    dist.all_reduce(flat_cpu, op=dist.ReduceOp.AVG)
+    dist.all_reduce(flat_buf[:flat.numel()], op=dist.ReduceOp.AVG)
 
     # Split back and copy to each parameter (non-blocking)
-    split = torch._utils._unflatten_dense_tensors(flat_cpu, grads)
+    split = torch._utils._unflatten_dense_tensors(flat_buf[:flat.numel()], grads)
     for p, g in zip(params, split):
         p.grad.data.copy_(g, non_blocking=True)
-
-    # Synchronize to ensure copies complete before optimizer step
-    torch.cuda.synchronize()
 
 
 # =============================================================================
@@ -489,6 +489,8 @@ def run_ddp(rank: int, world_size: int, devices: tuple, master_port: str, config
 
     # --- Build model (NO DDP wrapper — use manual CPU grad sync) ---
     model = GPTMini(model_cfg, tokenizer.vocab_size).to(f"cuda:{device}")
+    if world_size > 1:
+        _build_sync_buffers(model)
 
     # --- Optimizer ---
     optimizer = torch.optim.Adam(model.parameters(), lr=train_cfg.get("lr", 0.0002))

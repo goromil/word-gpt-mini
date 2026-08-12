@@ -1,0 +1,29 @@
+{
+  "model": {
+    "n_layer": 15,
+    "n_head": 8,
+    "head_dim": 192,
+    "seq_length": 64
+  },
+  "training": {
+    "epochs": 31,
+    "batch_size": 8,
+    "lr": 0.0002,
+    "gradient_accumulation_steps": 8,
+    "checkpoint_every": 6,
+    "checkpoint_interval": 10000,
+    "checkpoint_every_min": 30
+  },
+  "tokenizer": {
+    "max_vocab_size": 32768,
+    "max_word_len": 20
+  },
+  "paths": {
+    "data_dir": "E:\\training\\data",
+    "extra_data_dirs": [
+      "E:\\training\\data2\\bulgarian-corpus-33b"
+    ],
+    "checkpoint_dir": "E:\\training\\checkpoints",
+    "cache_dir": "E:\\training\\cache"
+  }
+}
