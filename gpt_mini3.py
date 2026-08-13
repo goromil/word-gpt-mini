@@ -1579,7 +1579,11 @@ def train():
 
     ckpt_interval = train_cfg.get("checkpoint_interval", 0)
     ckpt_every_min = train_cfg.get("checkpoint_every_min", 0)
-    grad_accum = train_cfg.get("gradient_accumulation_steps", 1)
+    sync_cfg = train_cfg.get("sync", {})
+    grad_accum = sync_cfg.get("gradient_accumulation_steps",
+                  train_cfg.get("gradient_accumulation_steps", 1))
+    use_bf16 = torch.cuda.is_bf16_supported()
+    log_interval = train_cfg.get("log_interval", 100)
 
     debug_one_step = os.environ.get("DEBUG_ONE_STEP", "0") == "1"
 
@@ -1603,6 +1607,8 @@ def train():
         err_file = open(ckpt_base / "errors.log", "w", encoding="utf-8")
         training_start_time = time.time()
         _ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        precision = "bf16" if use_bf16 else "fp32"
+        print(f"Precision: {precision}, Grad accumulation: {grad_accum}x", flush=True)
         print(f"Start time: {_ts}", flush=True)
         print(f"Training: vocab={tokenizer.vocab_size} | tokens={dataset.token_count:,} | samples={len(dataset):,} | params={sum(p.numel() for p in unwrapped_model.parameters())/1e6:.2f}M", flush=True)
         print("Starting training..." + (" [DEBUG_ONE_STEP]" if debug_one_step else ""), flush=True)
@@ -1619,6 +1625,7 @@ def train():
             except Exception as e:
                 _log_error(err_file, f"sampler.set_epoch({epoch}): {e}")
         model.train()
+        optimizer.zero_grad(set_to_none=True)
         epoch_start_time = time.time()
         for batch_idx, (x, y) in enumerate(dataloader):
             if debug_one_step and (batch_idx > 0 or global_batch > 0):
@@ -1626,14 +1633,25 @@ def train():
                     print(f"  [DEBUG] breaking after 1 batch", flush=True)
                 break
             x, y = x.to(DEVICE), y.to(DEVICE)
-            logits, loss = model(x, y)
-            optimizer.zero_grad(set_to_none=True)
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
+                logits, loss = model(x, y)
+            loss = loss / grad_accum
             loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
+            if (global_batch + 1) % grad_accum == 0:
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+            actual_loss = loss.item() * grad_accum
+            total_loss += actual_loss
             num_batches += 1
             global_batch += 1
             training_samples += x.size(0)
+            # Progress logging
+            if is_main and global_batch % log_interval == 0:
+                avg = total_loss / max(1, num_batches)
+                lr = optimizer.param_groups[0]["lr"]
+                print(f"  [{time.strftime('%H:%M:%S')}] Epoch {epoch} | "
+                      f"batch {global_batch} | loss {actual_loss:.4f} | "
+                      f"avg {avg:.4f} | lr {lr:.6e}", flush=True)
             should_ckpt = False
             if ckpt_interval > 0 and global_batch % ckpt_interval == 0:
                 should_ckpt = True
