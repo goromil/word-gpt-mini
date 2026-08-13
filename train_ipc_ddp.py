@@ -139,6 +139,14 @@ def build_tokenizer_and_dataset(rank, world_size, model_cfg, vocab_cfg, train_cf
     return tokenizer, dataset, vocab_hash
 
 
+def broadcast_weights(model, src=0):
+    """Broadcast all model parameters from src rank to all ranks — zero disk I/O."""
+    for p in model.parameters():
+        dist.broadcast(p.data, src=src)
+    for buf in model.buffers():
+        dist.broadcast(buf.data, src=src)
+
+
 def load_train_objs(tokenizer, dataset, model_cfg, device):
     """Returns model. Per tutorial: called AFTER ddp_setup()."""
     return GPTMini(model_cfg, tokenizer.vocab_size).to(f"cuda:{device}")
@@ -316,10 +324,8 @@ class Trainer:
                                                "seq_length": self.model_cfg["seq_length"],
                                                "training_samples": self.training_samples})
                     dist.barrier()
-                    # ALL ranks load the checkpoint to sync weights
-                    ckpt_state = torch.load(ckpt_dir / "model.pth", map_location=f"cuda:{self.device}")
-                    self.unwrapped_model.load_state_dict(ckpt_state)
-                    del ckpt_state
+                    # Sync weights via GPU broadcast — zero disk I/O
+                    broadcast_weights(self.unwrapped_model, src=0)
                 except Exception as e:
                     _log_error(self.err_file, f"checkpoint batch {self.global_batch}: {e}")
                 self.last_ckpt_time = time.time()
@@ -327,7 +333,7 @@ class Trainer:
                 self.total_loss = 0.0
 
     def _save_checkpoint(self, epoch: int, loss: float):
-        """Save from gpu_id == 0, then ALL ranks load to sync weights."""
+        """Save from gpu_id == 0, then broadcast weights to all ranks."""
         ckpt_dir = Path(self.paths["checkpoint_dir"]) / self.ckpt_hash
         if self.gpu_id == 0:
             _write_status(self.log_file, epoch, self.global_batch, loss,
@@ -340,10 +346,8 @@ class Trainer:
                                    "seq_length": self.model_cfg["seq_length"],
                                    "training_samples": self.training_samples})
         dist.barrier()
-        # ALL ranks load to sync weights
-        ckpt_state = torch.load(ckpt_dir / "model.pth", map_location=f"cuda:{self.device}")
-        self.unwrapped_model.load_state_dict(ckpt_state)
-        del ckpt_state
+        # Sync weights via GPU broadcast — zero disk I/O
+        broadcast_weights(self.unwrapped_model, src=0)
 
     def train(self, total_epochs: int, start_epoch: int = 0):
         scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=50, gamma=0.1, last_epoch=-1)

@@ -50,62 +50,104 @@ def dist_setup(rank: int, world_size: int, device: int, master_port: str):
 
 
 # =============================================================================
-# 2. MANUAL CPU GRADIENT SYNC  (flattened + pinned buffer)
+# 2. GRADIENT SYNC METHODS  (select via sync.method in config)
 # =============================================================================
-def _build_sync_buffers(model):
-    """Pre-allocate flattened pinned CPU buffer + CUDA stream for pipelined sync."""
+
+def _allreduce_gpu(model):
+    """Direct GPU all_reduce — zero CPU memory, no pinned buffers."""
+    for p in model.parameters():
+        if p.grad is not None:
+            dist.all_reduce(p.grad.data, op=dist.ReduceOp.AVG)
+
+
+def _build_chunked_buffers(model, num_chunks):
+    """Split params into num_chunks groups, each with own pinned buf + stream."""
     params = [p for p in model.parameters() if p.requires_grad]
-    total = sum(p.numel() for p in params)
     dtype = next(model.parameters()).dtype
-    model._sync_flat_cpu = torch.empty(total, dtype=dtype, device='cpu', pin_memory=True)
-    model._sync_params = params
-    model._sync_stream = torch.cuda.Stream()
-    model._sync_ev = torch.cuda.Event()
 
-def all_reduce_grads(model):
-    """
-    Average gradients across ranks via CPU. Overlaps GPU→CPU transfer with
-    the next forward pass using a dedicated sync stream.
+    # Split params evenly by element count
+    total = sum(p.numel() for p in params)
+    chunk_size = total // num_chunks
+    chunks = []
+    idx = 0
+    for i in range(num_chunks):
+        chunk_params = []
+        chunk_elems = 0
+        target = chunk_size if i < num_chunks - 1 else total - idx
+        while params[idx] and chunk_elems < target:
+            chunk_params.append(params[idx])
+            chunk_elems += params[idx].numel()
+            idx += 1
+        if chunk_params:
+            chunks.append(chunk_params)
 
-    Timeline:
-      default stream: fwd+bwd → flatten → [next batch fwd+bwd starts here]
-      sync stream:          [GPU→CPU copy] → (CPU waits, all_reduce, copy-back)
-    The CPU thread blocks for all_reduce, but both streams continue independently.
-    """
+    model._chunk_params = chunks
+    model._chunk_bufs = []
+    model._chunk_streams = []
+    model._chunk_events = []
+    for cp in chunks:
+        numel = sum(p.numel() for p in cp)
+        buf = torch.empty(numel, dtype=dtype, device='cpu', pin_memory=True)
+        stream = torch.cuda.Stream()
+        ev = torch.cuda.Event()
+        model._chunk_bufs.append(buf)
+        model._chunk_streams.append(stream)
+        model._chunk_events.append(ev)
+
+
+def _allreduce_chunked(model):
+    """Chunked CPU all_reduce — smaller pinned buffers, pipelined per-chunk."""
     world_size = dist.get_world_size()
     if world_size <= 1:
         return
 
-    params = model._sync_params
-    flat_buf = model._sync_flat_cpu
-    sync_stream = model._sync_stream
-    ev = model._sync_ev
+    chunks = model._chunk_params
+    bufs = model._chunk_bufs
+    streams = model._chunk_streams
+    events = model._chunk_events
 
-    # Flatten gradients on default stream (depends on fwd/bwd)
-    grads = [p.grad.data for p in params]
-    flat = torch._utils._flatten_dense_tensors(grads)
+    # Launch GPU->CPU transfer for each chunk on its own stream
+    for cp, buf, stream, ev in zip(chunks, bufs, streams, events):
+        grads = [p.grad.data for p in cp]
+        flat = torch._utils._flatten_dense_tensors(grads)
+        with torch.cuda.stream(stream):
+            stream.wait_stream(torch.cuda.current_stream())
+            buf[:flat.numel()].copy_(flat, non_blocking=True)
+            ev.record()
 
-    # Queue GPU→CPU transfer on sync stream (overlaps with next fwd)
-    with torch.cuda.stream(sync_stream):
-        sync_stream.wait_stream(torch.cuda.current_stream())
-        flat_buf[:flat.numel()].copy_(flat, non_blocking=True)
-        ev.record()
+    # CPU all_reduce per chunk + split back
+    for cp, buf, stream, ev in zip(chunks, bufs, streams, events):
+        ev.synchronize()
+        dist.all_reduce(buf[:buf.numel()], op=dist.ReduceOp.AVG)
+        grads = [p.grad.data for p in cp]
+        split = torch._utils._unflatten_dense_tensors(buf[:buf.numel()], grads)
+        with torch.cuda.stream(stream):
+            for p, g in zip(cp, split):
+                p.grad.data.copy_(g, non_blocking=True)
+            ev.record()
 
-    # CPU waits ONLY for the transfer (GPU default stream is free for fwd/bwd)
-    ev.synchronize()
+    # Wait for all chunks to finish
+    for ev in events:
+        ev.synchronize()
 
-    # all_reduce on CPU (both GPU streams can run fwd/bwd concurrently)
-    dist.all_reduce(flat_buf[:flat.numel()], op=dist.ReduceOp.AVG)
 
-    # Split back and copy to params on sync stream
-    split = torch._utils._unflatten_dense_tensors(flat_buf[:flat.numel()], grads)
-    with torch.cuda.stream(sync_stream):
-        for p, g in zip(params, split):
-            p.grad.data.copy_(g, non_blocking=True)
-        ev.record()
+def all_reduce_grads(model, sync_method="gpu"):
+    """Dispatch to sync method."""
+    world_size = dist.get_world_size()
+    if world_size <= 1:
+        return
+    if sync_method == "chunked_cpu":
+        _allreduce_chunked(model)
+    else:
+        _allreduce_gpu(model)
 
-    # Synchronize before next optimizer.step() on default stream
-    ev.synchronize()
+
+def broadcast_weights(model, src=0, device="cuda"):
+    """Broadcast all model parameters from src rank to all ranks — zero disk I/O."""
+    for p in model.parameters():
+        dist.broadcast(p.data, src=src)
+    for buf in model.buffers():
+        dist.broadcast(buf.data, src=src)
 
 
 # =============================================================================
@@ -257,6 +299,8 @@ class Trainer:
         sync_cfg = train_cfg.get("sync", {})
         self.grad_accum = sync_cfg.get("gradient_accumulation_steps",
                       train_cfg.get("gradient_accumulation_steps", 1))
+        self.sync_method = sync_cfg.get("method", "gpu")  # "gpu" or "chunked_cpu"
+        self.sync_chunks = sync_cfg.get("chunks", 4)
         self.use_bf16 = torch.cuda.is_bf16_supported()
         self.log_interval = train_cfg.get("log_interval", 100)
 
@@ -272,7 +316,7 @@ class Trainer:
             self.err_file = open(ckpt_base / "errors.log", "w", encoding="utf-8")
             self.training_start_time = time.time()
             precision = "bf16" if self.use_bf16 else "fp32"
-            print(f"Precision: {precision}, Grad accumulation: {self.grad_accum}x", flush=True)
+            print(f"Precision: {precision}, Grad accumulation: {self.grad_accum}x, Sync: {self.sync_method}", flush=True)
             print(f"Checkpoint hash: {ckpt_hash}", flush=True)
             print("Starting training...", flush=True)
 
@@ -330,7 +374,7 @@ class Trainer:
                 t_sync = 0.0
                 if (self.global_batch + 1) % self.grad_accum == 0:
                     t2 = time.time()
-                    all_reduce_grads(self.model)
+                    all_reduce_grads(self.model, self.sync_method)
                     self.optimizer.step()
                     self.optimizer.zero_grad(set_to_none=True)
                     t_sync = time.time() - t2
@@ -390,10 +434,8 @@ class Trainer:
                                                "seq_length": self.model_cfg["seq_length"],
                                                "training_samples": self.training_samples})
                     dist.barrier()
-                    # ALL ranks load the checkpoint to sync weights
-                    ckpt_state = torch.load(ckpt_dir / "model.pth", map_location=f"cuda:{self.device}")
-                    self.model.load_state_dict(ckpt_state)
-                    del ckpt_state
+                    # Sync weights via GPU broadcast — zero disk I/O
+                    broadcast_weights(self.model, src=0, device=f"cuda:{self.device}")
                 except Exception as e:
                     _log_error(self.err_file, f"checkpoint batch {self.global_batch}: {e}")
                 self.last_ckpt_time = time.time()
@@ -401,7 +443,7 @@ class Trainer:
                 self.total_loss = 0.0
 
     def _save_checkpoint(self, epoch: int, loss: float):
-        """Save from gpu_id == 0, then ALL ranks load to sync weights."""
+        """Save from gpu_id == 0, then broadcast weights to all ranks."""
         ckpt_dir = Path(self.paths["checkpoint_dir"]) / self.ckpt_hash
         if self.gpu_id == 0:
             _write_status(self.log_file, epoch, self.global_batch, loss,
@@ -414,10 +456,8 @@ class Trainer:
                                    "seq_length": self.model_cfg["seq_length"],
                                    "training_samples": self.training_samples})
         dist.barrier()
-        # ALL ranks load to sync weights
-        ckpt_state = torch.load(ckpt_dir / "model.pth", map_location=f"cuda:{self.device}")
-        self.model.load_state_dict(ckpt_state)
-        del ckpt_state
+        # Sync weights via GPU broadcast — zero disk I/O
+        broadcast_weights(self.model, src=0, device=f"cuda:{self.device}")
 
     def train(self, total_epochs: int, start_epoch: int = 0):
         scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=50, gamma=0.1, last_epoch=-1)
@@ -508,10 +548,18 @@ def run_ddp(rank: int, world_size: int, devices: tuple, master_port: str, config
         # --- Prepare dataloader ---
         train_data, sampler = prepare_dataloader(dataset, batch_size, rank, world_size)
 
-        # --- Build model (NO DDP wrapper — use manual CPU grad sync) ---
+        # --- Build model (NO DDP wrapper — manual grad sync) ---
         model = GPTMini(model_cfg, tokenizer.vocab_size).to(f"cuda:{device}")
-        if world_size > 1:
-            _build_sync_buffers(model)
+
+        # --- Init sync buffers (chunked_cpu method only) ---
+        sync_cfg = train_cfg.get("sync", {})
+        sync_method = sync_cfg.get("method", "gpu")
+        if sync_method == "chunked_cpu" and world_size > 1:
+            num_chunks = sync_cfg.get("chunks", 4)
+            _build_chunked_buffers(model, num_chunks)
+            if rank == 0:
+                chunk_mem = sum(b.element_size() * b.numel() for b in model._chunk_bufs) / (1024**3)
+                print(f"Sync buffers: {num_chunks} chunks, {chunk_mem:.2f} GB total (pinned CPU)", flush=True)
 
         # --- Optimizer ---
         optimizer = torch.optim.Adam(model.parameters(), lr=train_cfg.get("lr", 0.0002))
