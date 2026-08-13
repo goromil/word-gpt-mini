@@ -221,7 +221,11 @@ class Trainer:
             ckpt_dir = Path(paths["checkpoint_dir"])
             ckpt_base = ckpt_dir / ckpt_hash
             ckpt_base.mkdir(parents=True, exist_ok=True)
-            self.log_file = open(ckpt_base / "checkpoint_status.txt", "w", encoding="utf-8")
+            status_path = ckpt_base / "checkpoint_status.txt"
+            self.log_file = open(status_path, "a", encoding="utf-8")
+            # Write header only for new file
+            if not status_path.exists() or status_path.stat().st_size == 0:
+                self.log_file.write("time\tepoch\tbatch\tloss\ttok/s\tbatch/s\ttotal_samples\n")
             self.err_file = open(ckpt_base / "errors.log", "w", encoding="utf-8")
             self.training_start_time = time.time()
             precision = "bf16" if self.use_bf16 else "fp32"
@@ -272,6 +276,7 @@ class Trainer:
         self.num_batches = 0
         self.total_loss = 0.0
         self.training_samples = int(info.get("training_samples", 0))
+        self.training_start_time = info.get("training_start_time", self.training_start_time)
 
     def _run_epoch(self, epoch: int):
         """Run one training epoch. Per tutorial: call sampler.set_epoch() every epoch."""
@@ -338,9 +343,10 @@ class Trainer:
                         save_checkpoint(epoch, avg, self.combined_config, self.ckpt_hash,
                                         self.unwrapped_model, self.paths["checkpoint_dir"],
                                         extra={"global_batch": self.global_batch,
-                                               "batch_size": self.train_cfg["batch_size"],
-                                               "seq_length": self.model_cfg["seq_length"],
-                                               "training_samples": self.training_samples})
+                                                "batch_size": self.train_cfg["batch_size"],
+                                                "seq_length": self.model_cfg["seq_length"],
+                                                "training_samples": self.training_samples,
+                                                "training_start_time": self.training_start_time})
                     dist.barrier()
                     # No need to reload — DDP all_reduce already keeps weights in sync
                 except Exception as e:
@@ -359,9 +365,10 @@ class Trainer:
             save_checkpoint(epoch, loss, self.combined_config, self.ckpt_hash,
                             self.unwrapped_model, self.paths["checkpoint_dir"],
                             extra={"global_batch": self.global_batch,
-                                   "batch_size": self.train_cfg["batch_size"],
-                                   "seq_length": self.model_cfg["seq_length"],
-                                   "training_samples": self.training_samples})
+                                    "batch_size": self.train_cfg["batch_size"],
+                                    "seq_length": self.model_cfg["seq_length"],
+                                    "training_samples": self.training_samples,
+                                    "training_start_time": self.training_start_time})
         dist.barrier()
 
     def train(self, total_epochs: int, start_epoch: int = 0):

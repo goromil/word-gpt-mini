@@ -1574,11 +1574,16 @@ def train():
     log_file = None
     err_file = None
     training_start_time = None
+    if ckpt and is_main:
+        training_start_time = info.get("training_start_time", None)
     if is_main:
         ckpt_dir = Path(paths["checkpoint_dir"])
         ckpt_base = ckpt_dir / ckpt_hash
         ckpt_base.mkdir(parents=True, exist_ok=True)
-        log_file = open(ckpt_base / "checkpoint_status.txt", "a", encoding="utf-8")
+        status_path = ckpt_base / "checkpoint_status.txt"
+        log_file = open(status_path, "a", encoding="utf-8")
+        if not status_path.exists() or status_path.stat().st_size == 0:
+            log_file.write("time\tepoch\tbatch\tloss\ttok/s\tbatch/s\ttotal_samples\n")
         err_file = open(ckpt_base / "errors.log", "w", encoding="utf-8")
         training_start_time = time.time()
         _ts = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -1623,8 +1628,9 @@ def train():
                     if is_main:
                         _write_status(log_file, epoch, global_batch, avg, training_samples, model_cfg["seq_length"], training_start_time)
                         save_checkpoint(epoch, avg, combined_config, ckpt_hash, unwrapped_model, paths["checkpoint_dir"],
-                                        extra={"global_batch": global_batch, "batch_size": train_cfg["batch_size"],
-                                               "seq_length": model_cfg["seq_length"], "training_samples": training_samples})
+                                         extra={"global_batch": global_batch, "batch_size": train_cfg["batch_size"],
+                                                "seq_length": model_cfg["seq_length"], "training_samples": training_samples,
+                                                "training_start_time": training_start_time})
                     if dist.is_initialized():
                         dist.barrier()
                 except Exception as e:
@@ -1644,7 +1650,8 @@ def train():
                     _write_status(log_file, epoch, global_batch, avg_loss, training_samples, model_cfg["seq_length"], training_start_time)
                     save_checkpoint(epoch, avg_loss, combined_config, ckpt_hash, unwrapped_model, paths["checkpoint_dir"],
                                     extra={"global_batch": global_batch, "batch_size": train_cfg["batch_size"],
-                                           "seq_length": model_cfg["seq_length"], "training_samples": training_samples})
+                                           "seq_length": model_cfg["seq_length"], "training_samples": training_samples,
+                                           "training_start_time": training_start_time})
                 if dist.is_initialized():
                     dist.barrier()
             except Exception as e:
