@@ -10,10 +10,12 @@
     "batch_size": 64,
     "lr": 0.0002,
     "checkpoint_every": 1,
-    "checkpoint_interval": 100,
+    "checkpoint_interval": 1000,
     "checkpoint_every_min": 30,
     "sync": {
-      "gradient_accumulation_steps": 1024
+      "gradient_accumulation_steps": 1024,
+      "method": "cpu",
+      "chunks": 4
     }
   },
   "tokenizer": {

@@ -55,18 +55,19 @@ def dist_setup(rank: int, world_size: int, device: int, master_port: str):
 # =============================================================================
 
 def _allreduce_gpu(model):
-    """Direct GPU all_reduce — zero CPU memory, no pinned buffers."""
+    """Direct GPU all_reduce — zero CPU memory.
+    NOTE: crashes with gloo on Windows (gloo lacks CUDA tensor support).
+    Use only with NCCL backend."""
     for p in model.parameters():
         if p.grad is not None:
             dist.all_reduce(p.grad.data, op=dist.ReduceOp.AVG)
 
 
 def _build_chunked_buffers(model, num_chunks):
-    """Split params into num_chunks groups, each with own pinned buf + stream."""
+    """Split params into num_chunks groups, each with own pinned CPU buffer."""
     params = [p for p in model.parameters() if p.requires_grad]
     dtype = next(model.parameters()).dtype
 
-    # Split params evenly by element count
     total = sum(p.numel() for p in params)
     chunk_size = total // num_chunks
     chunks = []
@@ -84,56 +85,33 @@ def _build_chunked_buffers(model, num_chunks):
 
     model._chunk_params = chunks
     model._chunk_bufs = []
-    model._chunk_streams = []
-    model._chunk_events = []
     for cp in chunks:
         numel = sum(p.numel() for p in cp)
         buf = torch.empty(numel, dtype=dtype, device='cpu', pin_memory=True)
-        stream = torch.cuda.Stream()
-        ev = torch.cuda.Event()
         model._chunk_bufs.append(buf)
-        model._chunk_streams.append(stream)
-        model._chunk_events.append(ev)
 
 
 def _allreduce_chunked(model):
-    """Chunked CPU all_reduce — smaller pinned buffers, pipelined per-chunk."""
-    world_size = dist.get_world_size()
-    if world_size <= 1:
-        return
-
+    """Chunked CPU all_reduce — fully synchronous, one chunk at a time.
+    No pipelining: each chunk completes (copy→reduce→copy-back) before next.
+    Guarantees no race with next batch's backward."""
     chunks = model._chunk_params
     bufs = model._chunk_bufs
-    streams = model._chunk_streams
-    events = model._chunk_events
 
-    # Launch GPU->CPU transfer for each chunk on its own stream
-    for cp, buf, stream, ev in zip(chunks, bufs, streams, events):
+    for cp, buf in zip(chunks, bufs):
         grads = [p.grad.data for p in cp]
         flat = torch._utils._flatten_dense_tensors(grads)
-        with torch.cuda.stream(stream):
-            stream.wait_stream(torch.cuda.current_stream())
-            buf[:flat.numel()].copy_(flat, non_blocking=True)
-            ev.record()
-
-    # CPU all_reduce per chunk + split back
-    for cp, buf, stream, ev in zip(chunks, bufs, streams, events):
-        ev.synchronize()
+        buf[:flat.numel()].copy_(flat)  # blocking GPU→CPU
         dist.all_reduce(buf[:buf.numel()], op=dist.ReduceOp.AVG)
-        grads = [p.grad.data for p in cp]
         split = torch._utils._unflatten_dense_tensors(buf[:buf.numel()], grads)
-        with torch.cuda.stream(stream):
-            for p, g in zip(cp, split):
-                p.grad.data.copy_(g, non_blocking=True)
-            ev.record()
+        for p, g in zip(cp, split):
+            p.grad.data.copy_(g)  # blocking CPU→GPU
 
-    # Wait for all chunks to finish
-    for ev in events:
-        ev.synchronize()
+    torch.cuda.synchronize()
 
 
-def all_reduce_grads(model, sync_method="gpu"):
-    """Dispatch to sync method."""
+def all_reduce_grads(model, sync_method="cpu"):
+    """Dispatch to sync method. Default: cpu (gloo on Windows)."""
     world_size = dist.get_world_size()
     if world_size <= 1:
         return
@@ -292,7 +270,7 @@ class Trainer:
         sync_cfg = train_cfg.get("sync", {})
         self.grad_accum = sync_cfg.get("gradient_accumulation_steps",
                       train_cfg.get("gradient_accumulation_steps", 1))
-        self.sync_method = sync_cfg.get("method", "gpu")  # "gpu" or "cpu"
+        self.sync_method = sync_cfg.get("method", "cpu")  # "cpu" (default) or "gpu" (NCCL only)
         self.sync_chunks = sync_cfg.get("chunks", 4)
         self.use_bf16 = torch.cuda.is_bf16_supported()
         self.log_interval = train_cfg.get("log_interval", 100)
@@ -315,8 +293,10 @@ class Trainer:
 
         # Counters
         self.global_batch = 0
-        self.num_batches = 0
-        self.total_loss = 0.0
+        self.num_batches = 0          # resets on checkpoint — for checkpoint metadata
+        self.total_loss = 0.0         # resets on checkpoint — for checkpoint metadata
+        self.session_total_loss = 0.0 # never resets — for display
+        self.session_num_batches = 0  # never resets — for display
         self.training_samples = 0
         self.last_ckpt_time = time.time()
 
@@ -385,8 +365,11 @@ class Trainer:
                     self.optimizer.zero_grad(set_to_none=True)
                     t_sync = time.time() - t2
 
-                self.total_loss += loss.item() * self.grad_accum
+                actual_loss = loss.item() * self.grad_accum
+                self.total_loss += actual_loss
                 self.num_batches += 1
+                self.session_total_loss += actual_loss
+                self.session_num_batches += 1
                 self.global_batch += 1
                 self.training_samples += x.size(0)
 
@@ -398,13 +381,14 @@ class Trainer:
 
                 # Progress logging (rank 0 only)
                 if self.gpu_id == 0 and self.global_batch % self.log_interval == 0:
-                    avg = self.total_loss / max(1, self.num_batches)
+                    sess_avg = self.session_total_loss / max(1, self.session_num_batches)
                     total_t = self.elapsed_data + self.elapsed_fwd_bwd + self.elapsed_sync
                     p_data = self.elapsed_data / total_t * 100 if total_t else 0
                     p_fwd = self.elapsed_fwd_bwd / total_t * 100 if total_t else 0
                     p_sync = self.elapsed_sync / total_t * 100 if total_t else 0
                     print(f"[{time.strftime('%H:%M:%S')}] Epoch {epoch} | "
-                          f"batch {self.global_batch} | loss {avg:.4f} | "
+                          f"batch {self.global_batch} | loss {actual_loss:.4f} | "
+                          f"avg {sess_avg:.4f} | "
                           f"lr {self.optimizer.param_groups[0]['lr']:.6e} | "
                           f"time: data={p_data:.0f}% fwd/bwd={p_fwd:.0f}% sync={p_sync:.0f}%",
                           flush=True)
