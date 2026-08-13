@@ -46,6 +46,12 @@ class WordTokenizer:
                                             "vocab_size": self.vocab_size,
                                             "max_vocab_size": self.max_vocab_size,
                                             "max_word_len": self.max_word_len}))
+        # Persist vocab meta sidecar
+        meta_path = Path(str(path) + ".meta.json")
+        meta_path.write_text(json.dumps({"vocab_size": self.vocab_size,
+                                          "max_vocab_size": self.max_vocab_size,
+                                          "capped": self.vocab_size >= self.max_vocab_size},
+                                         separators=(",", ":")))
 
     def load(self, path):
         import json
@@ -111,7 +117,6 @@ class WordDataset(Dataset):
             print(f"  Loading cached dataset ({cache_file.stat().st_size // 1_000_000_000}GB)...", flush=True)
             arr = np.load(str(cache_file))
             if meta_file.exists():
-                import json
                 meta = json.loads(meta_file.read_text())
                 self.token_count = meta["tokens"]
             else:
@@ -141,8 +146,8 @@ class WordDataset(Dataset):
             self.token_count = pos
             print(f"  Saving cache ({pos//1_000_000}M tokens)...", flush=True)
             np.save(str(cache_file), arr)
-            # Persist token count for future loads
-            meta_file.write_text(json.dumps({"tokens": pos}, separators=(",", ":")))
+            # Persist dataset meta (tokens + vocab_size used)
+            meta_file.write_text(json.dumps({"tokens": pos, "vocab_size": tokenizer.vocab_size}, separators=(",", ":")))
 
         print(f"  Keeping {self.token_count//1_000_000}M tokens on CPU (transfers per batch)...", flush=True)
         self.data = arr  # keep as numpy array on CPU
