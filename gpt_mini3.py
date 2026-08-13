@@ -1291,8 +1291,8 @@ def _write_tier(ckpt_dir: str, cfg_hash: str, tier: int, epoch: int, loss: float
     d.mkdir(parents=True, exist_ok=True)
 
     sd = model.state_dict()
-    sd_fp16 = {k: v.half() if v.dtype == torch.float32 else v for k, v in sd.items()}
-    torch.save(sd_fp16, d / "model.pth")
+    sd_bf16 = {k: v.to(torch.bfloat16) if v.dtype == torch.float32 else v for k, v in sd.items()}
+    torch.save(sd_bf16, d / "model.pth")
 
     # Resume metadata as compact JSON
     meta = {"epoch": epoch, "loss": round(loss, 6), "config_hash": cfg_hash}
