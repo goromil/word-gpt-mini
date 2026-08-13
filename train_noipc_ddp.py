@@ -333,6 +333,12 @@ class Trainer:
                   f"global_batch {self.global_batch})", flush=True)
         self.model.load_state_dict(ckpt_state)
         del ckpt_state
+        # Restore session counters so avg doesn't reset on resume
+        self.session_num_batches = self.global_batch
+        self.session_total_loss = info["loss"] * self.global_batch
+        self.num_batches = 0
+        self.total_loss = 0.0
+        self.training_samples = int(info.get("training_samples", 0))
 
     def _run_epoch(self, epoch: int):
         """Run one training epoch. Per tutorial: call sampler.set_epoch() every epoch."""

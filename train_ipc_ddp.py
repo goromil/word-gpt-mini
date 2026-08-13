@@ -231,8 +231,10 @@ class Trainer:
 
         # Counters
         self.global_batch = 0
-        self.num_batches = 0
-        self.total_loss = 0.0
+        self.num_batches = 0          # resets on checkpoint — for checkpoint metadata
+        self.total_loss = 0.0         # resets on checkpoint — for checkpoint metadata
+        self.session_total_loss = 0.0 # never resets — for display
+        self.session_num_batches = 0  # never resets — for display
         self.training_samples = 0
         self.last_ckpt_time = time.time()
 
@@ -264,6 +266,12 @@ class Trainer:
                   f"global_batch {self.global_batch})", flush=True)
         self.unwrapped_model.load_state_dict(ckpt_state)
         del ckpt_state
+        # Restore session counters so avg doesn't reset on resume
+        self.session_num_batches = self.global_batch
+        self.session_total_loss = info["loss"] * self.global_batch
+        self.num_batches = 0
+        self.total_loss = 0.0
+        self.training_samples = int(info.get("training_samples", 0))
 
     def _run_epoch(self, epoch: int):
         """Run one training epoch. Per tutorial: call sampler.set_epoch() every epoch."""
@@ -289,16 +297,20 @@ class Trainer:
                     self.optimizer.step()
                     self.optimizer.zero_grad(set_to_none=True)
 
-                self.total_loss += loss.item() * self.grad_accum
+                actual_loss = loss.item() * self.grad_accum
+                self.total_loss += actual_loss
                 self.num_batches += 1
+                self.session_total_loss += actual_loss
+                self.session_num_batches += 1
                 self.global_batch += 1
                 self.training_samples += x.size(0)
 
                 # Progress logging (rank 0 only)
                 if self.gpu_id == 0 and self.global_batch % self.log_interval == 0:
-                    avg = self.total_loss / max(1, self.num_batches)
+                    sess_avg = self.session_total_loss / max(1, self.session_num_batches)
                     print(f"[{time.strftime('%H:%M:%S')}] Epoch {epoch} | "
-                          f"batch {self.global_batch} | loss {avg:.4f} | "
+                          f"batch {self.global_batch} | loss {actual_loss:.4f} | "
+                          f"avg {sess_avg:.4f} | "
                           f"lr {self.optimizer.param_groups[0]['lr']:.6e}",
                           flush=True)
             except Exception as e:
