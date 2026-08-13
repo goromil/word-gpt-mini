@@ -143,14 +143,6 @@ def all_reduce_grads(model, sync_method="gpu"):
         _allreduce_gpu(model)
 
 
-def broadcast_weights(model, src=0, device="cuda"):
-    """Broadcast all model parameters from src rank to all ranks — zero disk I/O."""
-    for p in model.parameters():
-        dist.broadcast(p.data, src=src)
-    for buf in model.buffers():
-        dist.broadcast(buf.data, src=src)
-
-
 # =============================================================================
 # 2. LOAD TRAINING OBJECTS
 # =============================================================================
@@ -448,10 +440,7 @@ class Trainer:
                                                "seq_length": self.model_cfg["seq_length"],
                                                "training_samples": self.training_samples})
                     dist.barrier()
-                    # ALL ranks load checkpoint to sync weights (disk is reliable)
-                    ckpt_state = torch.load(ckpt_dir / "model.pth", map_location=f"cuda:{self.device}")
-                    self.model.load_state_dict(ckpt_state)
-                    del ckpt_state
+                    # No need to reload — all_reduce already keeps weights in sync
                 except Exception as e:
                     _log_error(self.err_file, f"checkpoint batch {self.global_batch}: {e}")
                 self.last_ckpt_time = time.time()
@@ -459,7 +448,7 @@ class Trainer:
                 self.total_loss = 0.0
 
     def _save_checkpoint(self, epoch: int, loss: float):
-        """Save from gpu_id == 0, then ALL ranks load to sync weights."""
+        """Save from gpu_id == 0. No reload needed — all_reduce keeps weights synced."""
         ckpt_dir = Path(self.paths["checkpoint_dir"]) / self.ckpt_hash
         if self.gpu_id == 0:
             _write_status(self.log_file, epoch, self.global_batch, loss,
@@ -472,10 +461,6 @@ class Trainer:
                                    "seq_length": self.model_cfg["seq_length"],
                                    "training_samples": self.training_samples})
         dist.barrier()
-        # ALL ranks load to sync weights (disk is reliable)
-        ckpt_state = torch.load(ckpt_dir / "model.pth", map_location=f"cuda:{self.device}")
-        self.model.load_state_dict(ckpt_state)
-        del ckpt_state
 
     def train(self, total_epochs: int, start_epoch: int = 0):
         scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=50, gamma=0.1, last_epoch=-1)
