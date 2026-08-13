@@ -23,6 +23,7 @@ from gpt_mini3 import (
     GPTMini, WordTokenizer, WordDataset, ensure_corpus,
     save_checkpoint, find_latest_checkpoint, generate_text, get_model_hash, get_vocab_hash,
     _write_status, _log_error,
+    _try_restore_checkpoint, _cleanup_corrupt_checkpoint,
 )
 
 
@@ -73,8 +74,8 @@ def _build_chunked_buffers(model, num_chunks):
     for i in range(num_chunks):
         chunk_params = []
         chunk_elems = 0
-        target = chunk_size if i < num_chunks - 1 else total - idx
-        while params[idx] and chunk_elems < target:
+        target = chunk_size if i < num_chunks - 1 else total
+        while idx < len(params) and chunk_elems < target:
             chunk_params.append(params[idx])
             chunk_elems += params[idx].numel()
             idx += 1
@@ -136,7 +137,7 @@ def all_reduce_grads(model, sync_method="gpu"):
     world_size = dist.get_world_size()
     if world_size <= 1:
         return
-    if sync_method == "chunked_cpu":
+    if sync_method == "cpu":
         _allreduce_chunked(model)
     else:
         _allreduce_gpu(model)
@@ -299,7 +300,7 @@ class Trainer:
         sync_cfg = train_cfg.get("sync", {})
         self.grad_accum = sync_cfg.get("gradient_accumulation_steps",
                       train_cfg.get("gradient_accumulation_steps", 1))
-        self.sync_method = sync_cfg.get("method", "gpu")  # "gpu" or "chunked_cpu"
+        self.sync_method = sync_cfg.get("method", "gpu")  # "gpu" or "cpu"
         self.sync_chunks = sync_cfg.get("chunks", 4)
         self.use_bf16 = torch.cuda.is_bf16_supported()
         self.log_interval = train_cfg.get("log_interval", 100)
@@ -337,16 +338,29 @@ class Trainer:
 
     def _maybe_resume(self):
         ckpt = find_latest_checkpoint(self.paths["checkpoint_dir"], self.ckpt_hash)
-        if ckpt:
-            ep, info, ckpt_dir = ckpt
-            self.global_batch = int(info.get("global_batch", 0))
-            if self.gpu_id == 0:
-                print(f"Resuming from {ckpt_dir} (epoch {ep}, loss {info['loss']:.6f}, "
-                      f"global_batch {self.global_batch})", flush=True)
-            # ALL ranks load to sync weights
-            ckpt_state = torch.load(ckpt_dir / "model.pth", map_location=f"cuda:{self.device}")
-            self.model.load_state_dict(ckpt_state)
-            del ckpt_state
+        if not ckpt:
+            return
+        ep, info, ckpt_dir = ckpt
+        self.global_batch = int(info.get("global_batch", 0))
+        device_str = f"cuda:{self.device}"
+        try:
+            ckpt_state = torch.load(ckpt_dir / "model.pth", map_location=device_str)
+        except Exception:
+            # Corrupt checkpoint — try restoring from backup
+            if _try_restore_checkpoint(ckpt_dir):
+                if self.gpu_id == 0:
+                    print(f"Restored checkpoint from backup: {ckpt_dir}/model.pth.bak", flush=True)
+                ckpt_state = torch.load(ckpt_dir / "model.pth", map_location=device_str)
+            else:
+                if self.gpu_id == 0:
+                    print(f"Checkpoint corrupt, no backup — deleting and starting fresh: {ckpt_dir}", flush=True)
+                _cleanup_corrupt_checkpoint(ckpt_dir)
+                return
+        if self.gpu_id == 0:
+            print(f"Resuming from {ckpt_dir} (epoch {ep}, loss {info['loss']:.6f}, "
+                  f"global_batch {self.global_batch})", flush=True)
+        self.model.load_state_dict(ckpt_state)
+        del ckpt_state
 
     def _run_epoch(self, epoch: int):
         """Run one training epoch. Per tutorial: call sampler.set_epoch() every epoch."""
@@ -551,10 +565,10 @@ def run_ddp(rank: int, world_size: int, devices: tuple, master_port: str, config
         # --- Build model (NO DDP wrapper — manual grad sync) ---
         model = GPTMini(model_cfg, tokenizer.vocab_size).to(f"cuda:{device}")
 
-        # --- Init sync buffers (chunked_cpu method only) ---
+        # --- Init sync buffers (cpu method only) ---
         sync_cfg = train_cfg.get("sync", {})
         sync_method = sync_cfg.get("method", "gpu")
-        if sync_method == "chunked_cpu" and world_size > 1:
+        if sync_method == "cpu" and world_size > 1:
             num_chunks = sync_cfg.get("chunks", 4)
             _build_chunked_buffers(model, num_chunks)
             if rank == 0:

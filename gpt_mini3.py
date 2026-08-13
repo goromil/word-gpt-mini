@@ -1318,8 +1318,42 @@ def _tiers_for_epoch(epoch: int) -> list[int]:
     return tiers
 
 
+# =============================================================================
+# 5b. CHECKPOINT BACKUP / RESTORE
+# =============================================================================
+def _backup_checkpoint(ckpt_dir: Path):
+    """Before overwriting, back up model.pth → model.pth.bak (and tiers)."""
+    pth = ckpt_dir / "model.pth"
+    if pth.exists():
+        bak = ckpt_dir / "model.pth.bak"
+        import shutil
+        shutil.copy2(str(pth), str(bak))
+
+
+def _try_restore_checkpoint(ckpt_dir: Path):
+    """If model.pth is corrupt, try restoring from .bak; return True if restored."""
+    pth = ckpt_dir / "model.pth"
+    bak = ckpt_dir / "model.pth.bak"
+    if bak.exists():
+        import shutil
+        shutil.copy2(str(bak), str(pth))
+        return True
+    return False
+
+
+def _cleanup_corrupt_checkpoint(ckpt_dir: Path):
+    """Delete corrupt model.pth and any .bak."""
+    pth = ckpt_dir / "model.pth"
+    bak = ckpt_dir / "model.pth.bak"
+    if pth.exists():
+        pth.unlink()
+    if bak.exists():
+        bak.unlink()
+
+
 def save_checkpoint(epoch: int, loss: float, config: dict, cfg_hash: str, model: GPTMini, ckpt_dir: str, extra: dict | None = None):
     base = Path(ckpt_dir) / cfg_hash
+    _backup_checkpoint(base)
     needs_config = not (base / "config.json").exists()
     _write_tier(ckpt_dir, cfg_hash, 0, epoch, loss, config if needs_config else None, model, extra)
     tiers = _tiers_for_epoch(epoch)

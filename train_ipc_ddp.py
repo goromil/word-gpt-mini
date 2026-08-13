@@ -22,6 +22,7 @@ from gpt_mini3 import (
     GPTMini, WordTokenizer, WordDataset, ensure_corpus,
     save_checkpoint, find_latest_checkpoint, generate_text, get_model_hash, get_vocab_hash,
     _write_status, _log_error,
+    _try_restore_checkpoint, _cleanup_corrupt_checkpoint,
 )
 
 
@@ -248,16 +249,29 @@ class Trainer:
 
     def _maybe_resume(self):
         ckpt = find_latest_checkpoint(self.paths["checkpoint_dir"], self.ckpt_hash)
-        if ckpt:
-            ep, info, ckpt_dir = ckpt
-            self.global_batch = int(info.get("global_batch", 0))
-            if self.gpu_id == 0:
-                print(f"Resuming from {ckpt_dir} (epoch {ep}, loss {info['loss']:.6f}, "
-                      f"global_batch {self.global_batch})", flush=True)
-            # ALL ranks load to sync weights
-            ckpt_state = torch.load(ckpt_dir / "model.pth", map_location=f"cuda:{self.device}")
-            self.unwrapped_model.load_state_dict(ckpt_state)
-            del ckpt_state
+        if not ckpt:
+            return
+        ep, info, ckpt_dir = ckpt
+        self.global_batch = int(info.get("global_batch", 0))
+        device_str = f"cuda:{self.device}"
+        try:
+            ckpt_state = torch.load(ckpt_dir / "model.pth", map_location=device_str)
+        except Exception:
+            # Corrupt checkpoint — try restoring from backup
+            if _try_restore_checkpoint(ckpt_dir):
+                if self.gpu_id == 0:
+                    print(f"Restored checkpoint from backup: {ckpt_dir}/model.pth.bak", flush=True)
+                ckpt_state = torch.load(ckpt_dir / "model.pth", map_location=device_str)
+            else:
+                if self.gpu_id == 0:
+                    print(f"Checkpoint corrupt, no backup — deleting and starting fresh: {ckpt_dir}", flush=True)
+                _cleanup_corrupt_checkpoint(ckpt_dir)
+                return
+        if self.gpu_id == 0:
+            print(f"Resuming from {ckpt_dir} (epoch {ep}, loss {info['loss']:.6f}, "
+                  f"global_batch {self.global_batch})", flush=True)
+        self.unwrapped_model.load_state_dict(ckpt_state)
+        del ckpt_state
 
     def _run_epoch(self, epoch: int):
         """Run one training epoch. Per tutorial: call sampler.set_epoch() every epoch."""
