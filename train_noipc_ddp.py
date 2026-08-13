@@ -336,13 +336,13 @@ class Trainer:
         self.global_batch = int(info.get("global_batch", 0))
         device_str = f"cuda:{self.device}"
         try:
-            ckpt_state = torch.load(ckpt_dir / "model.pth", map_location=device_str)
+            ckpt_state = torch.load(ckpt_dir / "model.pth", map_location="cpu", weights_only=True)
         except Exception:
             # Corrupt checkpoint — try restoring from backup
             if _try_restore_checkpoint(ckpt_dir):
                 if self.gpu_id == 0:
                     print(f"Restored checkpoint from backup: {ckpt_dir}/model.pth.bak", flush=True)
-                ckpt_state = torch.load(ckpt_dir / "model.pth", map_location=device_str)
+                ckpt_state = torch.load(ckpt_dir / "model.pth", map_location="cpu", weights_only=True)
             else:
                 if self.gpu_id == 0:
                     print(f"Checkpoint corrupt, no backup — deleting and starting fresh: {ckpt_dir}", flush=True)
