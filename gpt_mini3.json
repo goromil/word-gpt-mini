@@ -1,19 +1,19 @@
 {
   "model": {
-    "n_layer": 15,
+    "n_layer": 30,
     "n_head": 8,
     "head_dim": 192,
     "seq_length": 64
   },
   "training": {
     "epochs": 31,
-    "batch_size": 8,
+    "batch_size": 64,
     "lr": 0.0002,
-    "checkpoint_every": 6,
-    "checkpoint_interval": 10000,
+    "checkpoint_every": 1,
+    "checkpoint_interval": 100,
     "checkpoint_every_min": 30,
     "sync": {
-      "gradient_accumulation_steps": 8
+      "gradient_accumulation_steps": 1024
     }
   },
   "tokenizer": {

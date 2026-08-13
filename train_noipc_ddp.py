@@ -11,7 +11,7 @@ Usage:
     python train_noipc_ddp.py -d 0 gpt_mini3.json      # GPU 0 only, custom config
     python train_noipc_ddp.py --epochs 10 --save_every 3
 """
-import os, sys, json, time, hashlib
+import os, sys, json, time, hashlib, signal, subprocess
 from pathlib import Path
 
 import torch
@@ -21,7 +21,7 @@ from torch.utils.data import Sampler as DataSampler
 
 from gpt_mini3 import (
     GPTMini, WordTokenizer, WordDataset, ensure_corpus,
-    save_checkpoint, find_latest_checkpoint, generate_text,
+    save_checkpoint, find_latest_checkpoint, generate_text, get_model_hash, get_vocab_hash,
     _write_status, _log_error,
 )
 
@@ -53,17 +53,24 @@ def dist_setup(rank: int, world_size: int, device: int, master_port: str):
 # 2. MANUAL CPU GRADIENT SYNC  (flattened + pinned buffer)
 # =============================================================================
 def _build_sync_buffers(model):
-    """Pre-allocate a single flattened pinned CPU buffer (called once at init)."""
+    """Pre-allocate flattened pinned CPU buffer + CUDA stream for pipelined sync."""
     params = [p for p in model.parameters() if p.requires_grad]
     total = sum(p.numel() for p in params)
     dtype = next(model.parameters()).dtype
     model._sync_flat_cpu = torch.empty(total, dtype=dtype, device='cpu', pin_memory=True)
     model._sync_params = params
+    model._sync_stream = torch.cuda.Stream()
+    model._sync_ev = torch.cuda.Event()
 
 def all_reduce_grads(model):
     """
-    Average gradients across ranks via CPU. Flattens all gradients into one
-    tensor for a single all_reduce call (much faster than per-param sync).
+    Average gradients across ranks via CPU. Overlaps GPU→CPU transfer with
+    the next forward pass using a dedicated sync stream.
+
+    Timeline:
+      default stream: fwd+bwd → flatten → [next batch fwd+bwd starts here]
+      sync stream:          [GPU→CPU copy] → (CPU waits, all_reduce, copy-back)
+    The CPU thread blocks for all_reduce, but both streams continue independently.
     """
     world_size = dist.get_world_size()
     if world_size <= 1:
@@ -71,24 +78,34 @@ def all_reduce_grads(model):
 
     params = model._sync_params
     flat_buf = model._sync_flat_cpu
+    sync_stream = model._sync_stream
+    ev = model._sync_ev
 
-    # Flatten gradients on GPU (fast in-place concat)
+    # Flatten gradients on default stream (depends on fwd/bwd)
     grads = [p.grad.data for p in params]
     flat = torch._utils._flatten_dense_tensors(grads)
 
-    # Non-blocking copy to pinned CPU buffer
-    flat_buf[:flat.numel()].copy_(flat, non_blocking=True)
+    # Queue GPU→CPU transfer on sync stream (overlaps with next fwd)
+    with torch.cuda.stream(sync_stream):
+        sync_stream.wait_stream(torch.cuda.current_stream())
+        flat_buf[:flat.numel()].copy_(flat, non_blocking=True)
+        ev.record()
 
-    # Wait for GPU→CPU transfer to complete
-    torch.cuda.synchronize()
+    # CPU waits ONLY for the transfer (GPU default stream is free for fwd/bwd)
+    ev.synchronize()
 
-    # Single all_reduce on the packed tensor
+    # all_reduce on CPU (both GPU streams can run fwd/bwd concurrently)
     dist.all_reduce(flat_buf[:flat.numel()], op=dist.ReduceOp.AVG)
 
-    # Split back and copy to each parameter (non-blocking)
+    # Split back and copy to params on sync stream
     split = torch._utils._unflatten_dense_tensors(flat_buf[:flat.numel()], grads)
-    for p, g in zip(params, split):
-        p.grad.data.copy_(g, non_blocking=True)
+    with torch.cuda.stream(sync_stream):
+        for p, g in zip(params, split):
+            p.grad.data.copy_(g, non_blocking=True)
+        ev.record()
+
+    # Synchronize before next optimizer.step() on default stream
+    ev.synchronize()
 
 
 # =============================================================================
@@ -107,25 +124,18 @@ def load_config(config_path: str) -> tuple[dict, dict, dict, dict]:
 
 def build_tokenizer_and_dataset(rank, world_size, model_cfg, vocab_cfg, train_cfg, paths):
     """Build vocab + dataset. Rank 0 builds, others load from cache."""
-    model_param_dict = {
-        "n_layer": model_cfg["n_layer"], "n_head": model_cfg["n_head"],
-        "head_dim": model_cfg["head_dim"], "seq_length": model_cfg["seq_length"],
-        "max_vocab_size": vocab_cfg.get("max_vocab_size", 32768),
-        "max_word_len": vocab_cfg.get("max_word_len", 20),
-    }
-    model_param_hash = hashlib.sha256(
-        json.dumps(model_param_dict, sort_keys=True).encode()
-    ).hexdigest()[:16]
-
-    cache_dir = Path(paths.get("cache_dir", "E:\\training\\cache"))
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    vocab_cache = cache_dir / f"vocab-{model_param_hash}.json"
-
-    # Corpus hash for data cache
+    # Collect all data directories for vocab hash
     data_dirs = [paths["data_dir"]]
     if "extra_data_dirs" in paths:
         data_dirs.extend(paths["extra_data_dirs"])
 
+    vocab_hash = get_vocab_hash(vocab_cfg, data_dirs)
+
+    cache_dir = Path(paths.get("cache_dir", "E:\\training\\cache"))
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    vocab_cache = cache_dir / f"vocab-{vocab_hash}.json"
+
+    # Corpus hash for data cache
     def _corpus_hash(directories):
         h = hashlib.sha256()
         for d in directories:
@@ -138,7 +148,7 @@ def build_tokenizer_and_dataset(rank, world_size, model_cfg, vocab_cfg, train_cf
         return h.hexdigest()[:16]
 
     corpus_h = _corpus_hash(data_dirs)
-    data_cache = cache_dir / f"data-{model_param_hash}-{corpus_h}.npy"
+    data_cache = cache_dir / f"data-{vocab_hash}-{corpus_h}.npy"
     is_main = (rank == 0)
 
     tokenizer = WordTokenizer(
@@ -175,7 +185,7 @@ def build_tokenizer_and_dataset(rank, world_size, model_cfg, vocab_cfg, train_cf
     if is_main:
         print(f"Dataset (all ranks ready): {len(dataset)} samples", flush=True)
 
-    return tokenizer, dataset, model_param_hash
+    return tokenizer, dataset, vocab_hash
 
 
 def load_train_objs(tokenizer, dataset, model_cfg, device):
@@ -410,7 +420,7 @@ class Trainer:
         del ckpt_state
 
     def train(self, total_epochs: int, start_epoch: int = 0):
-        scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=50, gamma=0.1)
+        scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=50, gamma=0.1, last_epoch=-1)
         for epoch in range(start_epoch + 1, total_epochs + 1):
             self._run_epoch(epoch)
 
@@ -420,11 +430,6 @@ class Trainer:
                       f"completed | avg_loss {avg_loss:.4f} | "
                       f"global_batch {self.global_batch}",
                       flush=True)
-
-            try:
-                scheduler.step()
-            except Exception as e:
-                _log_error(self.err_file, f"scheduler.step epoch {epoch}: {e}")
 
             # End-of-epoch checkpoint
             if epoch % self.ckpt_every == 0:
@@ -457,64 +462,95 @@ def run_ddp(rank: int, world_size: int, devices: tuple, master_port: str, config
         checkpoint_every: save checkpoint every N epochs
     """
     device = devices[rank]
+    dist_initialized = False
+    cuda_initialized = False
 
-    # Use multiple CPU threads for gloo all_reduce (default is 1 — too slow)
-    os.environ.setdefault("OMP_NUM_THREADS", str(max(1, (os.cpu_count() or 8) // 2)))
+    # Register this child's PID for cleanup
+    pid_file = os.environ.get("DDP_PID_FILE")
+    if pid_file:
+        try:
+            with open(pid_file, 'a') as f:
+                f.write(f"{os.getpid()}\n")
+        except Exception:
+            pass
 
-    # Reset CUDA context inherited from parent (fixes Windows 0xC0000005 crash)
     try:
-        torch.cuda.set_per_process_memory_fraction(1.0, device)
-    except (RuntimeError, AttributeError):
-        pass
+        # Use multiple CPU threads for gloo all_reduce (default is 1 — too slow)
+        os.environ.setdefault("OMP_NUM_THREADS", str(max(1, (os.cpu_count() or 8) // 2)))
 
-    dist_setup(rank, world_size, device, master_port)
+        # Reset CUDA context inherited from parent (fixes Windows 0xC0000005 crash)
+        try:
+            torch.cuda.set_per_process_memory_fraction(1.0, device)
+            cuda_initialized = True
+        except (RuntimeError, AttributeError):
+            pass
 
-    # --- Load config ---
-    model_cfg, vocab_cfg, train_cfg, paths = load_config(config_path)
+        dist_setup(rank, world_size, device, master_port)
+        dist_initialized = True
 
-    # Override from CLI
-    if total_epochs > 0:
-        train_cfg["epochs"] = total_epochs
-    if checkpoint_every > 0:
-        train_cfg["checkpoint_every"] = checkpoint_every
+        # --- Load config ---
+        model_cfg, vocab_cfg, train_cfg, paths = load_config(config_path)
 
-    total_epochs = train_cfg.get("epochs", 10)
-    batch_size = train_cfg.get("batch_size", 16)
+        # Override from CLI
+        if total_epochs > 0:
+            train_cfg["epochs"] = total_epochs
+        if checkpoint_every > 0:
+            train_cfg["checkpoint_every"] = checkpoint_every
 
-    # --- Build tokenizer + dataset ---
-    tokenizer, dataset, model_param_hash = build_tokenizer_and_dataset(
-        rank, world_size, model_cfg, vocab_cfg, train_cfg, paths
-    )
+        total_epochs = train_cfg.get("epochs", 10)
+        batch_size = train_cfg.get("batch_size", 16)
 
-    # --- Prepare dataloader ---
-    train_data, sampler = prepare_dataloader(dataset, batch_size, rank, world_size)
+        # --- Build tokenizer + dataset ---
+        tokenizer, dataset, vocab_hash = build_tokenizer_and_dataset(
+            rank, world_size, model_cfg, vocab_cfg, train_cfg, paths
+        )
 
-    # --- Build model (NO DDP wrapper — use manual CPU grad sync) ---
-    model = GPTMini(model_cfg, tokenizer.vocab_size).to(f"cuda:{device}")
-    if world_size > 1:
-        _build_sync_buffers(model)
+        # --- Prepare dataloader ---
+        train_data, sampler = prepare_dataloader(dataset, batch_size, rank, world_size)
 
-    # --- Optimizer ---
-    optimizer = torch.optim.Adam(model.parameters(), lr=train_cfg.get("lr", 0.0002))
+        # --- Build model (NO DDP wrapper — use manual CPU grad sync) ---
+        model = GPTMini(model_cfg, tokenizer.vocab_size).to(f"cuda:{device}")
+        if world_size > 1:
+            _build_sync_buffers(model)
 
-    # --- Combined config ---
-    combined_config = {"model": model_cfg, "training": train_cfg, "paths": paths}
-    combined_config["model"]["vocab"] = vocab_cfg
+        # --- Optimizer ---
+        optimizer = torch.optim.Adam(model.parameters(), lr=train_cfg.get("lr", 0.0002))
 
-    # --- Trainer (per tutorial) ---
-    trainer = Trainer(model, train_data, sampler, optimizer, rank, world_size,
-                      device, model_cfg, train_cfg, paths, model_param_hash,
-                      combined_config, tokenizer)
-    try:
-        trainer.train(total_epochs)
+        # --- Combined config ---
+        combined_config = {"model": model_cfg, "training": train_cfg, "paths": paths}
+        combined_config["model"]["vocab"] = vocab_cfg
+
+        # --- Trainer (per tutorial) ---
+        ckpt_hash = get_model_hash(model, vocab_hash)
+        trainer = Trainer(model, train_data, sampler, optimizer, rank, world_size,
+                           device, model_cfg, train_cfg, paths, ckpt_hash,
+                           combined_config, tokenizer)
+        try:
+            trainer.train(total_epochs)
+        finally:
+            trainer.close()
+
+    except torch.cuda.OutOfMemoryError as e:
+        print(f"[OOM] Rank {rank}: {e}", flush=True)
+        print(f"[OOM] Rank {rank}: Aborting — reduce n_layer, batch_size, or seq_length.", flush=True)
+        raise
+    except KeyboardInterrupt:
+        print(f"[Rank {rank}] Interrupted.", flush=True)
+        raise
     except Exception as e:
         print(f"Rank {rank} training error: {e}", flush=True)
         raise
     finally:
-        trainer.close()
-
-    # --- Cleanup ---
-    dist.destroy_process_group()
+        if cuda_initialized:
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+        if dist_initialized:
+            try:
+                dist.destroy_process_group()
+            except Exception:
+                pass
 
 
 # =============================================================================
@@ -535,6 +571,51 @@ def _get_cuda_device_count() -> int:
             return torch.cuda.device_count()
         except Exception:
             return 0
+
+
+_pid_file = None
+
+
+def _get_pid_file():
+    """Return a temp file path to track child PIDs."""
+    global _pid_file
+    if _pid_file is None:
+        import tempfile
+        _pid_file = tempfile.NamedTemporaryFile(prefix="ddp_pids_", suffix=".txt",
+                                                 delete=False, mode='w').name
+    return _pid_file
+
+
+def _get_child_pids():
+    """Read tracked child PIDs from file."""
+    pf = _get_pid_file()
+    try:
+        with open(pf, 'r') as f:
+            return [int(line.strip()) for line in f if line.strip().isdigit()]
+    except (FileNotFoundError, ValueError):
+        return []
+
+
+def _kill_orphans():
+    """Kill only our spawned child processes on Windows."""
+    pids = _get_child_pids()
+    if not pids:
+        print("[Cleanup] No child processes to terminate.", flush=True)
+        return
+    print(f"[Cleanup] Force-killing {len(pids)} child process(es): {pids}", flush=True)
+    for pid in pids:
+        try:
+            res = subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                                capture_output=True, text=True, timeout=5)
+            if res.returncode != 0:
+                print(f"  taskkill PID {pid}: {res.stderr.strip()}", flush=True)
+        except Exception as e:
+            print(f"  Failed to kill PID {pid}: {e}", flush=True)
+    time.sleep(0.5)
+    try:
+        os.unlink(_get_pid_file())
+    except OSError:
+        pass
 
 
 # =============================================================================
@@ -575,6 +656,14 @@ def run():
 
     world_size = len(devices)
 
+    # Setup PID tracking for children
+    pid_file = _get_pid_file()
+    try:
+        os.unlink(pid_file)
+    except FileNotFoundError:
+        pass
+    os.environ["DDP_PID_FILE"] = pid_file
+
     try:
         if world_size == 1:
             # TODO: single-GPU DDP silently exits after "Starting training..."
@@ -585,17 +674,21 @@ def run():
         else:
             mp.set_sharing_strategy("file_system")
             mp.spawn(run_ddp,
-                     args=(world_size, devices, args.port, args.config,
-                           args.epochs, args.save_every),
-                     nprocs=world_size,
-                     start_method="spawn",
-                     join=True)
+                      args=(world_size, devices, args.port, args.config,
+                            args.epochs, args.save_every),
+                      nprocs=world_size,
+                      start_method="spawn",
+                      join=True)
     except KeyboardInterrupt:
         print("\n[Ctrl+C] Shutting down...")
-        os._exit(1)
+        _kill_orphans()
+        time.sleep(1)
+        sys.exit(1)
     except Exception as e:
-        print(f"Training failed: {e}", flush=True)
-        raise
+        print(f"\n[ERROR] Training failed: {e}", flush=True)
+        _kill_orphans()
+        time.sleep(1)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

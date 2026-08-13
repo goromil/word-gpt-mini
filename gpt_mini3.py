@@ -1227,13 +1227,58 @@ def generate_text(model: GPTMini, tokenizer: WordTokenizer, prompt: str, max_new
 
 
 # =============================================================================
-# 5. CHECKPOINTING
+# 5. HASHES
 # =============================================================================
-# Layout: <ckpt_dir>/<cfg_hash>/          ← latest checkpoint + config (once)
-#         <ckpt_dir>/<cfg_hash>/1         ← every 10th epoch
-#         <ckpt_dir>/<cfg_hash>/2         ← every 100th epoch
-#         <ckpt_dir>/<cfg_hash>/3         ← every 1000th epoch
-#         <ckpt_dir>/<cfg_hash>/4         ← every 10000th epoch
+def get_vocab_hash(vocab_cfg: dict, data_dirs: list) -> str:
+    """Hash tokenizer config + data source file metadata (name, size, mtime).
+    The result is the single source of truth for vocab/data cache naming."""
+    h = hashlib.sha256()
+    # Tokenizer params
+    h.update(json.dumps({
+        "max_vocab_size": vocab_cfg.get("max_vocab_size", 32768),
+        "max_word_len": vocab_cfg.get("max_word_len", 20)
+    }, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+    # Data source file metadata
+    file_meta = []
+    for d in data_dirs:
+        dp = Path(d)
+        if dp.exists():
+            for fp in sorted(dp.glob("*.txt")):
+                st = fp.stat()
+                file_meta.append({"n": fp.name, "s": st.st_size, "t": st.st_mtime})
+    file_meta.sort(key=lambda x: x["n"])
+    h.update(json.dumps(file_meta, separators=(",", ":")).encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
+def get_model_hash(model, vocab_hash: str = None) -> str:
+    """Derive a deterministic hash from the model's actual tensor-defining
+    attributes + vocabulary identity.  Including vocab_hash ensures
+    checkpoints are never shared between different vocabularies, which
+    would make embedding weights meaningless."""
+    m = model.module if hasattr(model, "module") else model
+    h = hashlib.sha256()
+    h.update(json.dumps({
+        "vocab_size": int(m.transformer.wte.num_embeddings),
+        "n_embd": int(m.n_embd),
+        "n_layer": len(m.transformer.h),
+        "n_head": int(m.transformer.h[0].attn.n_head),
+        "head_dim": int(m.transformer.h[0].attn.head_dim),
+        "seq_length": int(m.wpe.size(1)),
+    }, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+    if vocab_hash:
+        h.update(vocab_hash.encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
+# =============================================================================
+# 6. CHECKPOINTING
+# =============================================================================
+# Layout: <ckpt_dir>/<model_hash>/          ← latest checkpoint + config (once)
+#         <ckpt_dir>/<model_hash>/1         ← every 10th epoch
+#         <ckpt_dir>/<model_hash>/2         ← every 100th epoch
+#         <ckpt_dir>/<model_hash>/3         ← every 1000th epoch
+#         <ckpt_dir>/<model_hash>/4         ← every 10000th epoch
 #         ...
 #         <ckpt_dir>/<cfg_hash>/15         ← every 1000000000000000th epoch
 
@@ -1364,39 +1409,30 @@ def train():
 
     vocab_cfg = model_cfg.pop("vocab") if "vocab" in model_cfg else model_cfg.pop("tokenizer", {})
 
-    model_param_dict = {
-        "n_layer": model_cfg["n_layer"],
-        "n_head": model_cfg["n_head"],
-        "head_dim": model_cfg["head_dim"],
-        "seq_length": model_cfg["seq_length"],
-        "max_vocab_size": vocab_cfg.get("max_vocab_size", 32768),
-        "max_word_len": vocab_cfg.get("max_word_len", 20)
-    }
-    model_param_hash = hashlib.sha256(json.dumps(model_param_dict, sort_keys=True).encode()).hexdigest()[:16]
-    cfg_hash = model_param_hash
-
     DEVICE = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     is_main = (local_rank == 0)
     print(f"Device: {DEVICE} (rank={local_rank})")
     if is_main:
         print(f"CUDA: {torch.cuda.is_available()} (GPU: {torch.cuda.get_device_name(DEVICE.index)})")
-    print(f"Model param hash: {model_param_hash}")
 
     cache_dir = Path(paths.get("cache_dir", "E:\\training\\cache"))
     cache_dir.mkdir(parents=True, exist_ok=True)
-    vocab_cache = cache_dir / f"vocab-{model_param_hash}.json"
 
-    # Checkpoint hash = model + training (distinguish training runs)
-    checkpoint_dict = {"model": model_param_dict, "training": train_cfg}
-    ckpt_hash = hashlib.sha256(json.dumps(checkpoint_dict, sort_keys=True).encode()).hexdigest()[:16]
+    # Collect all data directories for vocab hash
+    data_dirs = [paths["data_dir"]]
+    if "extra_data_dirs" in paths:
+        data_dirs.extend(paths["extra_data_dirs"])
 
-    # Corpus hash for data cache invalidation
-    data_cache = None
-    corpus_hash = None
+    vocab_hash = get_vocab_hash(vocab_cfg, data_dirs)
+    if is_main:
+        print(f"Vocab hash: {vocab_hash}")
+
+    vocab_cache = cache_dir / f"vocab-{vocab_hash}.json"
 
     # Tokenizer
     tokenizer = WordTokenizer(max_vocab_size=vocab_cfg.get("max_vocab_size", 32768), max_word_len=vocab_cfg.get("max_word_len", 20))
 
+    # Corpus hash for data cache invalidation
     def corpus_hash(data_dirs):
         """Hash all files in data_dirs for data cache invalidation."""
         h = hashlib.sha256()
@@ -1409,13 +1445,8 @@ def train():
                             h.update(chunk)
         return h.hexdigest()[:16]
 
-    # Collect all data directories
-    data_dirs = [paths["data_dir"]]
-    if "extra_data_dirs" in paths:
-        data_dirs.extend(paths["extra_data_dirs"])
-
     corpus_h = corpus_hash(data_dirs)
-    data_cache = cache_dir / f"data-{model_param_hash}-{corpus_h}.npy"
+    data_cache = cache_dir / f"data-{vocab_hash}-{corpus_h}.npy"
 
     sentences = []
     if vocab_cache.exists():
@@ -1458,11 +1489,20 @@ def train():
                 break
         model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=find_unused_parameters)
 
+    # Get unwrapped model for parameter access
+    unwrapped_model = model.module if hasattr(model, "module") else model
+
+    # Canonical checkpoint hash — derived from actual model tensor dims
+    ckpt_hash = get_model_hash(model, vocab_hash)
+    if is_main:
+        print(f"Checkpoint hash: {ckpt_hash}", flush=True)
+
     # Resume check
     start_epoch = 0
     global_batch = 0
+    ckpt_state = None
     if is_main:
-        ckpt = find_latest_checkpoint(paths["checkpoint_dir"], cfg_hash)
+        ckpt = find_latest_checkpoint(paths["checkpoint_dir"], ckpt_hash)
         if ckpt:
             ep, info, ckpt_path = ckpt
             global_batch = int(info.get("global_batch", 0))
@@ -1478,8 +1518,9 @@ def train():
         dist.broadcast_object_list(resume_data, src=0)
         start_epoch, global_batch = resume_data
 
-    # Get unwrapped model for parameter access
-    unwrapped_model = model.module if hasattr(model, "module") else model
+    # Load checkpointed weights
+    if ckpt_state is not None:
+        unwrapped_model.load_state_dict(ckpt_state)
 
     optimizer = torch.optim.Adam(unwrapped_model.parameters(), lr=train_cfg["lr"])
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.1)
@@ -1501,11 +1542,10 @@ def train():
         ckpt_dir = Path(paths["checkpoint_dir"])
         ckpt_base = ckpt_dir / ckpt_hash
         ckpt_base.mkdir(parents=True, exist_ok=True)
-        log_file = open(ckpt_base / "checkpoint_status.txt", "w", encoding="utf-8")
+        log_file = open(ckpt_base / "checkpoint_status.txt", "a", encoding="utf-8")
         err_file = open(ckpt_base / "errors.log", "w", encoding="utf-8")
         training_start_time = time.time()
         _ts = time.strftime("%Y-%m-%d %H:%M:%S")
-        print(f"Checkpoint hash: {ckpt_hash}", flush=True)
         print(f"Start time: {_ts}", flush=True)
         print("Starting training..." + (" [DEBUG_ONE_STEP]" if debug_one_step else ""), flush=True)
 

@@ -9,7 +9,7 @@ Usage:
     python train_ipc_ddp.py -d 0 gpt_mini3.json      # GPU 0 only, custom config
     python train_ipc_ddp.py --epochs 10 --save_every 3
 """
-import os, sys, json, time, hashlib
+import os, sys, json, time, hashlib, signal, subprocess
 from pathlib import Path
 
 import torch
@@ -20,7 +20,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from gpt_mini3 import (
     GPTMini, WordTokenizer, WordDataset, ensure_corpus,
-    save_checkpoint, find_latest_checkpoint, generate_text,
+    save_checkpoint, find_latest_checkpoint, generate_text, get_model_hash, get_vocab_hash,
     _write_status, _log_error,
 )
 
@@ -75,25 +75,18 @@ def load_config(config_path: str) -> tuple[dict, dict, dict, dict]:
 
 def build_tokenizer_and_dataset(rank, world_size, model_cfg, vocab_cfg, train_cfg, paths):
     """Build vocab + dataset. Rank 0 builds, others load from cache."""
-    model_param_dict = {
-        "n_layer": model_cfg["n_layer"], "n_head": model_cfg["n_head"],
-        "head_dim": model_cfg["head_dim"], "seq_length": model_cfg["seq_length"],
-        "max_vocab_size": vocab_cfg.get("max_vocab_size", 32768),
-        "max_word_len": vocab_cfg.get("max_word_len", 20),
-    }
-    model_param_hash = hashlib.sha256(
-        json.dumps(model_param_dict, sort_keys=True).encode()
-    ).hexdigest()[:16]
-
-    cache_dir = Path(paths.get("cache_dir", "E:\\training\\cache"))
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    vocab_cache = cache_dir / f"vocab-{model_param_hash}.json"
-
-    # Corpus hash for data cache
+    # Collect all data directories for vocab hash
     data_dirs = [paths["data_dir"]]
     if "extra_data_dirs" in paths:
         data_dirs.extend(paths["extra_data_dirs"])
 
+    vocab_hash = get_vocab_hash(vocab_cfg, data_dirs)
+
+    cache_dir = Path(paths.get("cache_dir", "E:\\training\\cache"))
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    vocab_cache = cache_dir / f"vocab-{vocab_hash}.json"
+
+    # Corpus hash for data cache
     def _corpus_hash(directories):
         h = hashlib.sha256()
         for d in directories:
@@ -106,7 +99,7 @@ def build_tokenizer_and_dataset(rank, world_size, model_cfg, vocab_cfg, train_cf
         return h.hexdigest()[:16]
 
     corpus_h = _corpus_hash(data_dirs)
-    data_cache = cache_dir / f"data-{model_param_hash}-{corpus_h}.npy"
+    data_cache = cache_dir / f"data-{vocab_hash}-{corpus_h}.npy"
     is_main = (rank == 0)
 
     tokenizer = WordTokenizer(
@@ -143,7 +136,7 @@ def build_tokenizer_and_dataset(rank, world_size, model_cfg, vocab_cfg, train_cf
     if is_main:
         print(f"Dataset (all ranks ready): {len(dataset)} samples", flush=True)
 
-    return tokenizer, dataset, model_param_hash
+    return tokenizer, dataset, vocab_hash
 
 
 def load_train_objs(tokenizer, dataset, model_cfg, device):
@@ -353,7 +346,7 @@ class Trainer:
         del ckpt_state
 
     def train(self, total_epochs: int, start_epoch: int = 0):
-        scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=50, gamma=0.1)
+        scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=50, gamma=0.1, last_epoch=-1)
         for epoch in range(start_epoch + 1, total_epochs + 1):
             self._run_epoch(epoch)
 
@@ -400,63 +393,94 @@ def run_ddp(rank: int, world_size: int, devices: tuple, master_port: str, config
         checkpoint_every: save checkpoint every N epochs
     """
     device = devices[rank]
+    dist_initialized = False
+    cuda_initialized = False
 
-    # Reset CUDA context inherited from parent (fixes Windows 0xC0000005 crash)
+    # Register this child's PID for cleanup
+    pid_file = os.environ.get("DDP_PID_FILE")
+    if pid_file:
+        try:
+            with open(pid_file, 'a') as f:
+                f.write(f"{os.getpid()}\n")
+        except Exception:
+            pass
+
     try:
-        torch.cuda.set_per_process_memory_fraction(1.0, device)
-    except (RuntimeError, AttributeError):
-        pass
+        # Reset CUDA context inherited from parent (fixes Windows 0xC0000005 crash)
+        try:
+            torch.cuda.set_per_process_memory_fraction(1.0, device)
+            cuda_initialized = True
+        except (RuntimeError, AttributeError):
+            pass
 
-    ddp_setup(rank, world_size, device, master_port)
+        ddp_setup(rank, world_size, device, master_port)
+        dist_initialized = True
 
-    # --- Load config ---
-    model_cfg, vocab_cfg, train_cfg, paths = load_config(config_path)
+        # --- Load config ---
+        model_cfg, vocab_cfg, train_cfg, paths = load_config(config_path)
 
-    # Override from CLI
-    if total_epochs > 0:
-        train_cfg["epochs"] = total_epochs
-    if checkpoint_every > 0:
-        train_cfg["checkpoint_every"] = checkpoint_every
+        # Override from CLI
+        if total_epochs > 0:
+            train_cfg["epochs"] = total_epochs
+        if checkpoint_every > 0:
+            train_cfg["checkpoint_every"] = checkpoint_every
 
-    total_epochs = train_cfg.get("epochs", 10)
-    batch_size = train_cfg.get("batch_size", 16)
+        total_epochs = train_cfg.get("epochs", 10)
+        batch_size = train_cfg.get("batch_size", 16)
 
-    # --- Build tokenizer + dataset ---
-    tokenizer, dataset, model_param_hash = build_tokenizer_and_dataset(
-        rank, world_size, model_cfg, vocab_cfg, train_cfg, paths
-    )
+        # --- Build tokenizer + dataset ---
+        tokenizer, dataset, vocab_hash = build_tokenizer_and_dataset(
+            rank, world_size, model_cfg, vocab_cfg, train_cfg, paths
+        )
 
-    # --- Prepare dataloader (per tutorial) ---
-    train_data, sampler = prepare_dataloader(dataset, batch_size, rank, world_size)
+        # --- Prepare dataloader (per tutorial) ---
+        train_data, sampler = prepare_dataloader(dataset, batch_size, rank, world_size)
 
-    # --- Build model ---
-    model = GPTMini(model_cfg, tokenizer.vocab_size).to(f"cuda:{device}")
+        # --- Build model ---
+        model = GPTMini(model_cfg, tokenizer.vocab_size).to(f"cuda:{device}")
 
-    # --- DDP wrap (per tutorial) ---
-    model = DDP(model, device_ids=[device], output_device=device)
+        # --- DDP wrap (per tutorial) ---
+        model = DDP(model, device_ids=[device], output_device=device)
 
-    # --- Optimizer ---
-    unwrapped_model = model.module
-    optimizer = torch.optim.Adam(unwrapped_model.parameters(), lr=train_cfg.get("lr", 0.0002))
+        # --- Optimizer ---
+        unwrapped_model = model.module
+        optimizer = torch.optim.Adam(unwrapped_model.parameters(), lr=train_cfg.get("lr", 0.0002))
 
-    # --- Combined config ---
-    combined_config = {"model": model_cfg, "training": train_cfg, "paths": paths}
-    combined_config["model"]["vocab"] = vocab_cfg
+        # --- Combined config ---
+        combined_config = {"model": model_cfg, "training": train_cfg, "paths": paths}
+        combined_config["model"]["vocab"] = vocab_cfg
 
-    # --- Trainer (per tutorial) ---
-    trainer = Trainer(model, train_data, sampler, optimizer, rank, world_size,
-                      device, model_cfg, train_cfg, paths, model_param_hash,
-                      combined_config, tokenizer, unwrapped_model)
-    try:
-        trainer.train(total_epochs)
+        # --- Trainer (per tutorial) ---
+        ckpt_hash = get_model_hash(model, vocab_hash)
+        trainer = Trainer(model, train_data, sampler, optimizer, rank, world_size,
+                           device, model_cfg, train_cfg, paths, ckpt_hash,
+                           combined_config, tokenizer, unwrapped_model)
+        try:
+            trainer.train(total_epochs)
+        finally:
+            trainer.close()
+
+    except torch.cuda.OutOfMemoryError as e:
+        print(f"[OOM] Rank {rank}: {e}", flush=True)
+        print(f"[OOM] Rank {rank}: Aborting — reduce n_layer, batch_size, or seq_length.", flush=True)
+        raise
+    except KeyboardInterrupt:
+        print(f"[Rank {rank}] Interrupted.", flush=True)
+        raise
     except Exception as e:
         print(f"Rank {rank} training error: {e}", flush=True)
         raise
     finally:
-        trainer.close()
-
-    # --- Cleanup ---
-    dist.destroy_process_group()
+        if cuda_initialized:
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+        if dist_initialized:
+            try:
+                dist.destroy_process_group()
+            except Exception:
+                pass
 
 
 # =============================================================================
@@ -466,7 +490,6 @@ def _get_cuda_device_count() -> int:
     """Get GPU count without initializing CUDA context.
     Uses nvidia-smi to avoid corrupting CUDA context for mp.spawn children."""
     try:
-        import subprocess
         out = subprocess.check_output(
             ["nvidia-smi", "--query-gpu=count", "--format=csv,noheader"],
             stderr=subprocess.DEVNULL, text=True, timeout=10
@@ -477,6 +500,51 @@ def _get_cuda_device_count() -> int:
             return torch.cuda.device_count()
         except Exception:
             return 0
+
+
+_pid_file = None
+
+
+def _get_pid_file():
+    """Return a temp file path to track child PIDs."""
+    global _pid_file
+    if _pid_file is None:
+        import tempfile
+        _pid_file = tempfile.NamedTemporaryFile(prefix="ddp_pids_", suffix=".txt",
+                                                 delete=False, mode='w').name
+    return _pid_file
+
+
+def _get_child_pids():
+    """Read tracked child PIDs from file."""
+    pf = _get_pid_file()
+    try:
+        with open(pf, 'r') as f:
+            return [int(line.strip()) for line in f if line.strip().isdigit()]
+    except (FileNotFoundError, ValueError):
+        return []
+
+
+def _kill_orphans():
+    """Kill only our spawned child processes on Windows."""
+    pids = _get_child_pids()
+    if not pids:
+        print("[Cleanup] No child processes to terminate.", flush=True)
+        return
+    print(f"[Cleanup] Force-killing {len(pids)} child process(es): {pids}", flush=True)
+    for pid in pids:
+        try:
+            res = subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                                capture_output=True, text=True, timeout=5)
+            if res.returncode != 0:
+                print(f"  taskkill PID {pid}: {res.stderr.strip()}", flush=True)
+        except Exception as e:
+            print(f"  Failed to kill PID {pid}: {e}", flush=True)
+    time.sleep(0.5)
+    try:
+        os.unlink(_get_pid_file())
+    except OSError:
+        pass
 
 
 # =============================================================================
@@ -517,6 +585,14 @@ def run():
 
     world_size = len(devices)
 
+    # Setup PID tracking for children
+    pid_file = _get_pid_file()
+    try:
+        os.unlink(pid_file)
+    except FileNotFoundError:
+        pass
+    os.environ["DDP_PID_FILE"] = pid_file
+
     try:
         if world_size == 1:
             # TODO: single-GPU DDP silently exits after "Starting training..."
@@ -527,17 +603,21 @@ def run():
         else:
             mp.set_sharing_strategy("file_system")
             mp.spawn(run_ddp,
-                     args=(world_size, devices, args.port, args.config,
-                           args.epochs, args.save_every),
-                     nprocs=world_size,
-                     start_method="spawn",
-                     join=True)
+                      args=(world_size, devices, args.port, args.config,
+                            args.epochs, args.save_every),
+                      nprocs=world_size,
+                      start_method="spawn",
+                      join=True)
     except KeyboardInterrupt:
         print("\n[Ctrl+C] Shutting down...")
-        os._exit(1)
+        _kill_orphans()
+        time.sleep(1)
+        sys.exit(1)
     except Exception as e:
-        print(f"Training failed: {e}", flush=True)
-        raise
+        print(f"\n[ERROR] Training failed: {e}", flush=True)
+        _kill_orphans()
+        time.sleep(1)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
