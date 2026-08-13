@@ -185,8 +185,8 @@ def prepare_dataloader(dataset, batch_size: int, rank: int, world_size: int):
 # =============================================================================
 class Trainer:
     def __init__(self, model, train_data, sampler, optimizer, rank, world_size,
-                 device, model_cfg, train_cfg, paths, ckpt_hash, combined_config,
-                 tokenizer, unwrapped_model):
+                  device, model_cfg, train_cfg, paths, ckpt_hash, combined_config,
+                  tokenizer, unwrapped_model, dataset_tokens=0, dataset_samples=0):
         self.model = model
         self.train_data = train_data
         self.sampler = sampler
@@ -202,6 +202,8 @@ class Trainer:
         self.combined_config = combined_config
         self.tokenizer = tokenizer
         self.unwrapped_model = unwrapped_model
+        self.dataset_tokens = dataset_tokens
+        self.dataset_samples = dataset_samples
 
         # Checkpoint config
         self.ckpt_interval = train_cfg.get("checkpoint_interval", 0)
@@ -231,6 +233,7 @@ class Trainer:
             precision = "bf16" if self.use_bf16 else "fp32"
             print(f"Precision: {precision}, Grad accumulation: {self.grad_accum}x", flush=True)
             print(f"Checkpoint hash: {ckpt_hash}", flush=True)
+            print(f"Training: vocab={self.tokenizer.vocab_size} | tokens={self.dataset_tokens:,} | samples={self.dataset_samples:,} | params={sum(p.numel() for p in self.unwrapped_model.parameters())/1e6:.2f}M", flush=True)
             print("Starting training...", flush=True)
 
         # Counters
@@ -346,7 +349,10 @@ class Trainer:
                                                 "batch_size": self.train_cfg["batch_size"],
                                                 "seq_length": self.model_cfg["seq_length"],
                                                 "training_samples": self.training_samples,
-                                                "training_start_time": self.training_start_time})
+                                                "training_start_time": self.training_start_time,
+                                                "vocab_size": self.tokenizer.vocab_size,
+                                                "dataset_tokens": self.dataset_tokens,
+                                                "dataset_samples": self.dataset_samples})
                     dist.barrier()
                     # No need to reload — DDP all_reduce already keeps weights in sync
                 except Exception as e:
@@ -368,7 +374,10 @@ class Trainer:
                                     "batch_size": self.train_cfg["batch_size"],
                                     "seq_length": self.model_cfg["seq_length"],
                                     "training_samples": self.training_samples,
-                                    "training_start_time": self.training_start_time})
+                                    "training_start_time": self.training_start_time,
+                                    "vocab_size": self.tokenizer.vocab_size,
+                                    "dataset_tokens": self.dataset_tokens,
+                                    "dataset_samples": self.dataset_samples})
         dist.barrier()
 
     def train(self, total_epochs: int, start_epoch: int = 0):
@@ -479,8 +488,10 @@ def run_ddp(rank: int, world_size: int, devices: tuple, master_port: str, config
         # --- Trainer (per tutorial) ---
         ckpt_hash = get_model_hash(model, vocab_hash)
         trainer = Trainer(model, train_data, sampler, optimizer, rank, world_size,
-                           device, model_cfg, train_cfg, paths, ckpt_hash,
-                           combined_config, tokenizer, unwrapped_model)
+                            device, model_cfg, train_cfg, paths, ckpt_hash,
+                            combined_config, tokenizer, unwrapped_model,
+                            dataset_tokens=len(dataset.data),
+                            dataset_samples=len(dataset))
         try:
             trainer.train(total_epochs)
         finally:

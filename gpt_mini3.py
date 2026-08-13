@@ -1588,6 +1588,7 @@ def train():
         training_start_time = time.time()
         _ts = time.strftime("%Y-%m-%d %H:%M:%S")
         print(f"Start time: {_ts}", flush=True)
+        print(f"Training: vocab={tokenizer.vocab_size} | tokens={len(dataset.data):,} | samples={len(dataset):,} | params={sum(p.numel() for p in unwrapped_model.parameters())/1e6:.2f}M", flush=True)
         print("Starting training..." + (" [DEBUG_ONE_STEP]" if debug_one_step else ""), flush=True)
 
     last_ckpt_time = time.time()
@@ -1628,9 +1629,12 @@ def train():
                     if is_main:
                         _write_status(log_file, epoch, global_batch, avg, training_samples, model_cfg["seq_length"], training_start_time)
                         save_checkpoint(epoch, avg, combined_config, ckpt_hash, unwrapped_model, paths["checkpoint_dir"],
-                                         extra={"global_batch": global_batch, "batch_size": train_cfg["batch_size"],
-                                                "seq_length": model_cfg["seq_length"], "training_samples": training_samples,
-                                                "training_start_time": training_start_time})
+                                          extra={"global_batch": global_batch, "batch_size": train_cfg["batch_size"],
+                                                 "seq_length": model_cfg["seq_length"], "training_samples": training_samples,
+                                                 "training_start_time": training_start_time,
+                                                 "vocab_size": tokenizer.vocab_size,
+                                                 "dataset_tokens": len(dataset.data),
+                                                 "dataset_samples": len(dataset)})
                     if dist.is_initialized():
                         dist.barrier()
                 except Exception as e:
@@ -1651,7 +1655,10 @@ def train():
                     save_checkpoint(epoch, avg_loss, combined_config, ckpt_hash, unwrapped_model, paths["checkpoint_dir"],
                                     extra={"global_batch": global_batch, "batch_size": train_cfg["batch_size"],
                                            "seq_length": model_cfg["seq_length"], "training_samples": training_samples,
-                                           "training_start_time": training_start_time})
+                                           "training_start_time": training_start_time,
+                                           "vocab_size": tokenizer.vocab_size,
+                                           "dataset_tokens": len(dataset.data),
+                                           "dataset_samples": len(dataset)})
                 if dist.is_initialized():
                     dist.barrier()
             except Exception as e:
