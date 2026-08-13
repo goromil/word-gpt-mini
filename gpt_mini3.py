@@ -77,7 +77,8 @@ class WordTokenizer:
                 self.word2idx[word] = idx
                 self.idx2word[idx] = word
         self.vocab_size = len(self.word2idx)
-        print(f"Vocabulary size: {self.vocab_size} (max: {self.max_vocab_size})")
+        capped = "(CAP REACHED)" if self.vocab_size >= self.max_vocab_size else ""
+        print(f"Vocabulary size: {self.vocab_size} (max: {self.max_vocab_size}) {capped}")
 
     def _tokenize_text(self, text: str) -> list[str]:
         return text.lower().split()
@@ -105,10 +106,17 @@ class WordDataset(Dataset):
             cache_file = Path("data_cache.npy")
         else:
             cache_file = Path(cache_file)
+        meta_file = Path(str(cache_file) + ".meta.json")
         if cache_file.exists() and (cache_file.stat().st_size > 1_000_000_000):
             print(f"  Loading cached dataset ({cache_file.stat().st_size // 1_000_000_000}GB)...", flush=True)
             arr = np.load(str(cache_file))
-            print(f"  Cache hit: {len(arr)} tokens loaded", flush=True)
+            if meta_file.exists():
+                import json
+                meta = json.loads(meta_file.read_text())
+                self.token_count = meta["tokens"]
+            else:
+                self.token_count = len(arr)
+            print(f"  Cache hit: {self.token_count:,} tokens loaded", flush=True)
         else:
             # Estimate size and pre-allocate
             est = 0
@@ -130,14 +138,17 @@ class WordDataset(Dataset):
                     print(f"    {i+1}/{total} texts, {pos//1_000_000}M tokens", flush=True)
 
             arr = arr[:pos]
+            self.token_count = pos
             print(f"  Saving cache ({pos//1_000_000}M tokens)...", flush=True)
             np.save(str(cache_file), arr)
+            # Persist token count for future loads
+            meta_file.write_text(json.dumps({"tokens": pos}, separators=(",", ":")))
 
-        print(f"  Keeping {len(arr)//1_000_000}M tokens on CPU (transfers per batch)...", flush=True)
+        print(f"  Keeping {self.token_count//1_000_000}M tokens on CPU (transfers per batch)...", flush=True)
         self.data = arr  # keep as numpy array on CPU
         del arr
         self.seq_length = seq_length
-        print(f"  Dataset ready: {len(self)} samples", flush=True)
+        print(f"  Dataset ready: {len(self):,} samples (from {self.token_count:,} tokens, seq_len={self.seq_length})", flush=True)
 
     def __len__(self):
         return max(0, len(self.data) - self.seq_length)
@@ -1588,7 +1599,7 @@ def train():
         training_start_time = time.time()
         _ts = time.strftime("%Y-%m-%d %H:%M:%S")
         print(f"Start time: {_ts}", flush=True)
-        print(f"Training: vocab={tokenizer.vocab_size} | tokens={len(dataset.data):,} | samples={len(dataset):,} | params={sum(p.numel() for p in unwrapped_model.parameters())/1e6:.2f}M", flush=True)
+        print(f"Training: vocab={tokenizer.vocab_size} | tokens={dataset.token_count:,} | samples={len(dataset):,} | params={sum(p.numel() for p in unwrapped_model.parameters())/1e6:.2f}M", flush=True)
         print("Starting training..." + (" [DEBUG_ONE_STEP]" if debug_one_step else ""), flush=True)
 
     last_ckpt_time = time.time()
@@ -1633,8 +1644,8 @@ def train():
                                                  "seq_length": model_cfg["seq_length"], "training_samples": training_samples,
                                                  "training_start_time": training_start_time,
                                                  "vocab_size": tokenizer.vocab_size,
-                                                 "dataset_tokens": len(dataset.data),
-                                                 "dataset_samples": len(dataset)})
+                                                 "dataset_tokens": dataset.token_count,
+                                                  "dataset_samples": len(dataset)})
                     if dist.is_initialized():
                         dist.barrier()
                 except Exception as e:
@@ -1657,7 +1668,7 @@ def train():
                                            "seq_length": model_cfg["seq_length"], "training_samples": training_samples,
                                            "training_start_time": training_start_time,
                                            "vocab_size": tokenizer.vocab_size,
-                                           "dataset_tokens": len(dataset.data),
+                                           "dataset_tokens": dataset.token_count,
                                            "dataset_samples": len(dataset)})
                 if dist.is_initialized():
                     dist.barrier()

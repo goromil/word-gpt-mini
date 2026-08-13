@@ -490,7 +490,7 @@ def run_ddp(rank: int, world_size: int, devices: tuple, master_port: str, config
         trainer = Trainer(model, train_data, sampler, optimizer, rank, world_size,
                             device, model_cfg, train_cfg, paths, ckpt_hash,
                             combined_config, tokenizer, unwrapped_model,
-                            dataset_tokens=len(dataset.data),
+                            dataset_tokens=dataset.token_count,
                             dataset_samples=len(dataset))
         try:
             trainer.train(total_epochs)
