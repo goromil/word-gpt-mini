@@ -338,8 +338,10 @@ class Trainer:
                                                "seq_length": self.model_cfg["seq_length"],
                                                "training_samples": self.training_samples})
                     dist.barrier()
-                    # Sync weights via GPU broadcast — zero disk I/O
-                    broadcast_weights(self.unwrapped_model, src=0)
+                    # ALL ranks load checkpoint to sync weights (disk is reliable)
+                    ckpt_state = torch.load(ckpt_dir / "model.pth", map_location=f"cuda:{self.device}")
+                    self.unwrapped_model.load_state_dict(ckpt_state)
+                    del ckpt_state
                 except Exception as e:
                     _log_error(self.err_file, f"checkpoint batch {self.global_batch}: {e}")
                 self.last_ckpt_time = time.time()
@@ -347,7 +349,7 @@ class Trainer:
                 self.total_loss = 0.0
 
     def _save_checkpoint(self, epoch: int, loss: float):
-        """Save from gpu_id == 0, then broadcast weights to all ranks."""
+        """Save from gpu_id == 0, then ALL ranks load to sync weights."""
         ckpt_dir = Path(self.paths["checkpoint_dir"]) / self.ckpt_hash
         if self.gpu_id == 0:
             _write_status(self.log_file, epoch, self.global_batch, loss,
@@ -360,8 +362,10 @@ class Trainer:
                                    "seq_length": self.model_cfg["seq_length"],
                                    "training_samples": self.training_samples})
         dist.barrier()
-        # Sync weights via GPU broadcast — zero disk I/O
-        broadcast_weights(self.unwrapped_model, src=0)
+        # ALL ranks load to sync weights (disk is reliable)
+        ckpt_state = torch.load(ckpt_dir / "model.pth", map_location=f"cuda:{self.device}")
+        self.unwrapped_model.load_state_dict(ckpt_state)
+        del ckpt_state
 
     def train(self, total_epochs: int, start_epoch: int = 0):
         scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=50, gamma=0.1, last_epoch=-1)
