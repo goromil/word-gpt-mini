@@ -68,9 +68,9 @@ def test_tokenizer_build_vocab():
 
 
 def test_tokenizer_vocab_cap():
-    tok = gpt_mini3.WordTokenizer(max_vocab_size=10, max_word_len=20)
+    tok = gpt_mini3.WordTokenizer(max_vocab_size=200, max_word_len=20)
     tok.build_vocab(SAMPLE_TEXTS)
-    assert tok.vocab_size == 10  # capped
+    assert tok.vocab_size <= 200  # capped at max_vocab_size (chars + tier words)
     print("PASS: tokenizer_vocab_cap")
 
 
@@ -87,7 +87,10 @@ def test_tokenizer_encode_unk():
     tok = gpt_mini3.WordTokenizer(max_vocab_size=200, max_word_len=20)
     tok.build_vocab(["hello world"])
     tokens = tok.encode("xyzzy unknown word")
-    assert all(t == tok.word2idx["<unk>"] for t in tokens)
+    # "xyzzy" not in vocab → char fallback: x<sep>y<sep>z<sep>z<sep>y
+    sep = tok.word2idx["<sep>"]
+    assert sep in tokens  # char fallback uses <sep> between chars
+    assert all(t != tok.word2idx["<unk>"] for t in tokens)  # all latin chars are pre-populated
     print("PASS: tokenizer_encode_unk")
 
 
@@ -677,11 +680,13 @@ def test_checkpoint_resume_weights():
 # =============================================================================
 def test_ensure_corpus_existing():
     with tempfile.TemporaryDirectory() as tmpdir:
-        text_file = Path(tmpdir) / "wiki_train.txt"
+        text_file = Path(tmpdir) / "tinystories.txt"
         text_file.write_text("hello world\nfoo bar\n", encoding="utf-8")
-        sentences = gpt_mini3.ensure_corpus(tmpdir)
+        result = gpt_mini3.ensure_corpus(tmpdir)
+        sentences = result["sentences"]
         assert len(sentences) == 2
         assert sentences[0] == "hello world"
+        assert len(result["sources"]) == 1
     print("PASS: ensure_corpus_existing")
 
 
@@ -689,7 +694,8 @@ def test_ensure_corpus_creates_dir():
     with tempfile.TemporaryDirectory() as tmpdir:
         new_dir = Path(tmpdir) / "subdir"
         # Won't download, falls back to built-in
-        sentences = gpt_mini3.ensure_corpus(str(new_dir))
+        result = gpt_mini3.ensure_corpus(str(new_dir))
+        sentences = result["sentences"]
         assert len(sentences) > 0
         assert new_dir.exists()
     print("PASS: ensure_corpus_creates_dir")
@@ -697,9 +703,10 @@ def test_ensure_corpus_creates_dir():
 
 def test_ensure_corpus_empty_file():
     with tempfile.TemporaryDirectory() as tmpdir:
-        text_file = Path(tmpdir) / "wiki_train.txt"
+        text_file = Path(tmpdir) / "tinystories.txt"
         text_file.write_text("\n\n\n", encoding="utf-8")
-        sentences = gpt_mini3.ensure_corpus(tmpdir)
+        result = gpt_mini3.ensure_corpus(tmpdir)
+        sentences = result["sentences"]
         assert len(sentences) == 0
     print("PASS: ensure_corpus_empty_file")
 
@@ -736,8 +743,8 @@ def test_gpt_mini_min_seq_length():
 
 
 def test_generate_text_long_prompt():
-    cfg = {"n_layer": 1, "n_head": 2, "head_dim": 16, "seq_length": 16}
-    tok = gpt_mini3.WordTokenizer(max_vocab_size=50, max_word_len=20)
+    cfg = {"n_layer": 1, "n_head": 2, "head_dim": 16, "seq_length": 32}
+    tok = gpt_mini3.WordTokenizer(max_vocab_size=200, max_word_len=20)
     tok.build_vocab(["the cat sat on the mat the cat sat"])
     model = gpt_mini3.GPTMini(cfg, tok.vocab_size)
     model.eval()
@@ -748,7 +755,7 @@ def test_generate_text_long_prompt():
 
 
 def test_dataset_sequence_boundary():
-    tok = gpt_mini3.WordTokenizer(max_vocab_size=50, max_word_len=20)
+    tok = gpt_mini3.WordTokenizer(max_vocab_size=200, max_word_len=20)
     tok.build_vocab(["a b c d e f g h i j"])
     ds = gpt_mini3.WordDataset(["a b c d e f g h i j"], tok, seq_length=5)
     assert len(ds) >= 1

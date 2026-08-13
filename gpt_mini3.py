@@ -36,9 +36,27 @@ class WordTokenizer:
     def __init__(self, max_vocab_size: int = 20000, max_word_len: int = 20):
         self.max_vocab_size = max_vocab_size
         self.max_word_len = max_word_len
-        self.word2idx = {"<pad>": 0, "<unk>": 1, "<eos>": 2}
-        self.idx2word = {0: "<pad>", 1: "<unk>", 2: "<eos>"}
-        self.vocab_size = 3
+        self._sources = None
+        self._tier_ratios = None
+        self._char_slots = 0
+        # Reserved tokens
+        self.word2idx = {"<pad>": 0, "<unk>": 1, "<eos>": 2, "<sep>": 3}
+        self.idx2word = {0: "<pad>", 1: "<unk>", 2: "<eos>", 3: "<sep>"}
+        self._populate_chars()
+        self.vocab_size = len(self.word2idx)
+
+    def _populate_chars(self):
+        chars = ""
+        chars += "abcdefghijklmnopqrstuvwxyz"
+        chars += "абвгдежзийклмнопрстуфхцчшщъыьэюяё"
+        chars += "0123456789"
+        chars += "'-"
+        for ch in chars:
+            if ch not in self.word2idx:
+                idx = len(self.word2idx)
+                self.word2idx[ch] = idx
+                self.idx2word[idx] = ch
+        self._char_slots = len(chars)
 
     def save(self, path):
         import json
@@ -48,10 +66,17 @@ class WordTokenizer:
                                             "max_word_len": self.max_word_len}))
         # Persist vocab meta sidecar
         meta_path = Path(str(path) + ".meta.json")
-        meta_path.write_text(json.dumps({"vocab_size": self.vocab_size,
-                                          "max_vocab_size": self.max_vocab_size,
-                                          "capped": self.vocab_size >= self.max_vocab_size},
-                                         separators=(",", ":")))
+        meta = {
+            "vocab_size": self.vocab_size,
+            "max_vocab_size": self.max_vocab_size,
+            "capped": self.vocab_size >= self.max_vocab_size,
+            "char_slots": self._char_slots
+        }
+        if self._sources:
+            meta["sources"] = self._sources
+        if self._tier_ratios:
+            meta["tier_ratios"] = self._tier_ratios
+        meta_path.write_text(json.dumps(meta, separators=(",", ":")))
 
     def load(self, path):
         import json
@@ -61,27 +86,66 @@ class WordTokenizer:
         self.vocab_size = data["vocab_size"]
         self.max_vocab_size = data.get("max_vocab_size", self.max_vocab_size)
         self.max_word_len = data.get("max_word_len", self.max_word_len)
+        # Restore meta from sidecar if available
+        meta_path = Path(str(path) + ".meta.json")
+        if meta_path.exists():
+            meta = json.loads(meta_path.read_text())
+            self._char_slots = meta.get("char_slots", 0)
+            self._sources = meta.get("sources", None)
+            self._tier_ratios = meta.get("tier_ratios", None)
 
-    def build_vocab(self, texts: list[str]):
-        freq: dict[str, int] = {}
-        total = len(texts)
-        for i, text in enumerate(texts):
-            if (i + 1) % 2000000 == 0 or i == total - 1:
-                print(f"  Building vocab: {i+1}/{total} texts ({(i+1)*100//total}%)", flush=True)
-            for word in self._tokenize_text(text):
-                if len(word) > self.max_word_len:
-                    continue
-                freq[word] = freq.get(word, 0) + 1
-
-        print(f"  Sorting {len(freq)} unique words...")
-        sorted_words = sorted(freq.items(), key=lambda x: -x[1])
-        for word, _ in sorted_words:
-            if len(self.word2idx) >= self.max_vocab_size:
-                break
-            if word not in self.word2idx:
-                idx = len(self.word2idx)
-                self.word2idx[word] = idx
-                self.idx2word[idx] = word
+    def build_vocab(self, texts: list[str], sources: list[dict] = None, tier_ratios: list[float] = None):
+        tier_ratios = tier_ratios or [0.66, 0.22, 0.12]
+        if sources is None:
+            # Legacy: bare list of strings, all tier 1
+            sources = [{"sentences": texts, "tier": 1, "dir": "", "file": "", "language": None}]
+        # Collect frequency per tier
+        tier_freq: dict[int, dict[str, int]] = {}
+        tier_sources: dict[int, list[dict]] = {}
+        total_texts = sum(len(s.get("sentences", [])) for s in sources)
+        processed = 0
+        for src in sources:
+            t = src.get("tier", 1)
+            if t not in tier_freq:
+                tier_freq[t] = {}
+                tier_sources[t] = []
+            for text in src.get("sentences", []):
+                processed += 1
+                if processed % 2000000 == 0 or processed == total_texts:
+                    print(f"  Building vocab: {processed}/{total_texts} texts ({processed*100//total_texts}%)", flush=True)
+                for word in self._tokenize_text(text):
+                    if len(word) > self.max_word_len:
+                        continue
+                    tier_freq[t][word] = tier_freq[t].get(word, 0) + 1
+            tier_sources[t].append(src)
+        # Allocate slots per tier
+        available = self.max_vocab_size - len(self.word2idx)
+        source_meta = []
+        for tier in sorted(tier_freq.keys()):
+            ratio = tier_ratios[tier - 1] if tier - 1 < len(tier_ratios) else 0
+            slot_count = int(available * ratio)
+            freq = tier_freq[tier]
+            print(f"  Tier {tier}: {len(freq)} unique words, allocating {slot_count} slots")
+            sorted_words = sorted(freq.items(), key=lambda x: -x[1])
+            tier_word_count = 0
+            for word, _ in sorted_words:
+                if tier_word_count >= slot_count:
+                    break
+                if word not in self.word2idx:
+                    idx = len(self.word2idx)
+                    self.word2idx[word] = idx
+                    self.idx2word[idx] = word
+                    tier_word_count += 1
+            for src in tier_sources[tier]:
+                source_meta.append({
+                    "dir": src.get("dir", ""),
+                    "file": src.get("file", ""),
+                    "tier": tier,
+                    "language": src.get("language"),
+                    "words_in_vocab": tier_word_count
+                })
+        self._sources = source_meta
+        self._tier_ratios = tier_ratios
         self.vocab_size = len(self.word2idx)
         capped = "(CAP REACHED)" if self.vocab_size >= self.max_vocab_size else ""
         print(f"Vocabulary size: {self.vocab_size} (max: {self.max_vocab_size}) {capped}")
@@ -89,9 +153,25 @@ class WordTokenizer:
     def _tokenize_text(self, text: str) -> list[str]:
         return text.lower().split()
 
-    def encode(self, text: str) -> list[int]:
+    def tokenize_word(self, word: str) -> list[int]:
+        if word in self.word2idx:
+            return [self.word2idx[word]]
         unk = self.word2idx["<unk>"]
-        return [self.word2idx.get(w, unk) for w in self._tokenize_text(text) if len(w) <= self.max_word_len]
+        sep = self.word2idx["<sep>"]
+        result = []
+        for i, ch in enumerate(word):
+            if i > 0:
+                result.append(sep)
+            result.append(self.word2idx.get(ch, unk))
+        return result
+
+    def encode(self, text: str) -> list[int]:
+        result = []
+        for word in self._tokenize_text(text):
+            if len(word) > self.max_word_len:
+                continue
+            result.extend(self.tokenize_word(word))
+        return result
 
     def decode(self, indices: list[int]) -> str:
         return " ".join(self.idx2word.get(i, "<unk>") for i in indices)
@@ -123,11 +203,11 @@ class WordDataset(Dataset):
                 self.token_count = len(arr)
             print(f"  Cache hit: {self.token_count:,} tokens loaded", flush=True)
         else:
-            # Estimate size and pre-allocate
+            # Estimate size and pre-allocate (2x for char-fallback expansion)
             est = 0
             for text in texts:
                 est += len(text.split()) + 1
-            est = int(est * 1.1)
+            est = int(est * 2.0)
             arr = np.empty(est, dtype=np.int32)
             pos = 0
 
@@ -135,8 +215,10 @@ class WordDataset(Dataset):
                 for w in text.lower().split():
                     w = w.strip(strip_chars)
                     if 1 <= len(w) <= maxlen:
-                        arr[pos] = tokenizer.word2idx.get(w, unk)
-                        pos += 1
+                        tokens = tokenizer.tokenize_word(w)
+                        for idx in tokens:
+                            arr[pos] = idx
+                            pos += 1
                 arr[pos] = eos
                 pos += 1
                 if (i + 1) % 2000000 == 0 or i == total - 1:
@@ -1075,14 +1157,13 @@ Shell al pesto di basilico shell basil pesto.
 Ziti al ragù di carne tube meat sauce baked.
 """
 
-def ensure_corpus(data_dir: str, extra_dirs: list = None) -> list[str]:
+def ensure_corpus(data_dir: str, extra_dirs: list = None) -> dict:
     data_path = Path(data_dir)
     data_path.mkdir(parents=True, exist_ok=True)
     text_file = data_path / "tinystories.txt"
 
-    if text_file.exists():
-        print(f"Using existing corpus: {text_file} ({os.path.getsize(text_file) / (1024*1024):.1f} MB)")
-    else:
+    # Fallback: create wiki_train.txt if no corpus exists
+    if not text_file.exists():
         print(f"Corpus not found at {text_file}")
         print(f"Run: python init_training.py --download --force")
         print(f"Falling back to built-in corpus.")
@@ -1090,8 +1171,16 @@ def ensure_corpus(data_dir: str, extra_dirs: list = None) -> list[str]:
         with open(text_file, "w", encoding="utf-8") as f:
             f.write(BUILTIN_CORPUS)
 
-    all_sentences = []
-    text_files = [text_file]
+    # Gather all .txt from primary data_dir
+    text_files = []
+    for fn in sorted(data_path.glob("*.txt")):
+        if fn.name.endswith(".meta.json"):
+            continue
+        if fn not in text_files:
+            text_files.append(fn)
+            sz = fn.stat().st_size / (1024*1024)
+            label = "primary" if fn.name == "tinystories.txt" else "corpus"
+            print(f"  Found {label}: {fn.name} ({sz:.1f} MB)")
 
     if extra_dirs:
         for extra in extra_dirs:
@@ -1102,15 +1191,33 @@ def ensure_corpus(data_dir: str, extra_dirs: list = None) -> list[str]:
                         text_files.append(fn)
                         print(f"  Found extra corpus: {fn} ({fn.stat().st_size / (1024*1024):.0f} MB)")
 
+    if not text_files:
+        text_files = [text_file]
+
+    all_sentences = []
+    sources = []
     for tf in text_files:
-        print(f"  Reading {tf} ...")
+        meta_file = Path(str(tf) + ".meta.json")
+        meta = {}
+        if meta_file.exists():
+            meta = json.loads(meta_file.read_text())
+        tier = meta.get("tier", 1)
+        language = meta.get("language", None)
+        print(f"  Reading {tf} ... (tier={tier}" + (f", lang={language}" if language else "") + ")")
         with open(tf, "r", encoding="utf-8") as f:
             raw = f.read()
         sentences = [s.strip() for s in raw.split("\n") if s.strip()]
+        sources.append({
+            "dir": str(tf.parent),
+            "file": tf.name,
+            "tier": tier,
+            "language": language,
+            "sentences": sentences
+        })
         all_sentences.extend(sentences)
 
     print(f"Loaded {len(all_sentences)} total sentences from {len(text_files)} files")
-    return all_sentences
+    return {"sentences": all_sentences, "sources": sources}
 
 
 # =============================================================================
@@ -1246,7 +1353,7 @@ def generate_text(model: GPTMini, tokenizer: WordTokenizer, prompt: str, max_new
 # 5. HASHES
 # =============================================================================
 def get_vocab_hash(vocab_cfg: dict, data_dirs: list) -> str:
-    """Hash tokenizer config + data source file metadata (name, size, mtime).
+    """Hash tokenizer config + data source file metadata (name, size, mtime, tier).
     The result is the single source of truth for vocab/data cache naming."""
     h = hashlib.sha256()
     # Tokenizer params
@@ -1254,14 +1361,23 @@ def get_vocab_hash(vocab_cfg: dict, data_dirs: list) -> str:
         "max_vocab_size": vocab_cfg.get("max_vocab_size", 32768),
         "max_word_len": vocab_cfg.get("max_word_len", 20)
     }, sort_keys=True, separators=(",", ":")).encode("utf-8"))
-    # Data source file metadata
+    # Data source file metadata + tier from .meta.json
     file_meta = []
     for d in data_dirs:
         dp = Path(d)
         if dp.exists():
             for fp in sorted(dp.glob("*.txt")):
                 st = fp.stat()
-                file_meta.append({"n": fp.name, "s": st.st_size, "t": st.st_mtime})
+                meta_file = Path(str(fp) + ".meta.json")
+                meta = {}
+                if meta_file.exists():
+                    meta = json.loads(meta_file.read_text())
+                file_meta.append({
+                    "n": fp.name,
+                    "s": st.st_size,
+                    "t": st.st_mtime,
+                    "tier": meta.get("tier", 1)
+                })
     file_meta.sort(key=lambda x: x["n"])
     h.update(json.dumps(file_meta, separators=(",", ":")).encode("utf-8"))
     return h.hexdigest()[:16]
@@ -1501,14 +1617,16 @@ def train():
     data_cache = cache_dir / f"data-{vocab_hash}-{corpus_h}.npy"
 
     sentences = []
+    corpus = None
     if vocab_cache.exists():
         if is_main:
             print(f"Loading cached vocab from {vocab_cache}", flush=True)
         tokenizer.load(str(vocab_cache))
     else:
         if is_main:
-            sentences = ensure_corpus(paths["data_dir"], paths.get("extra_data_dirs", []))
-            tokenizer.build_vocab(sentences)
+            corpus = ensure_corpus(paths["data_dir"], paths.get("extra_data_dirs", []))
+            sentences = corpus["sentences"]
+            tokenizer.build_vocab(sentences, sources=corpus["sources"])
             tokenizer.save(str(vocab_cache))
             print(f"Vocab cached to {vocab_cache}", flush=True)
 
@@ -1520,7 +1638,8 @@ def train():
         pass  # sentences already loaded from vocab build
     else:
         if is_main:
-            sentences = ensure_corpus(paths["data_dir"], paths.get("extra_data_dirs", []))
+            corpus = ensure_corpus(paths["data_dir"], paths.get("extra_data_dirs", []))
+            sentences = corpus["sentences"]
 
     # Dataset
     dataset = WordDataset(sentences, tokenizer, model_cfg["seq_length"], cache_file=str(data_cache))

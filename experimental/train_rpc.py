@@ -272,19 +272,22 @@ def build_tokenizer_and_dataset(rank, world_size, model_cfg, vocab_cfg, paths, b
     )
 
     sentences = []
+    corpus = None
     if vocab_cache.exists() and data_cache.exists() and data_cache.stat().st_size > 1_000_000_000:
         if is_main:
             print("Loading cached vocab + dataset...", flush=True)
         tokenizer.load(vocab_cache)
     else:
         if is_main:
-            sentences = ensure_corpus(paths["data_dir"], paths.get("extra_data_dirs", []))
-            tokenizer.build_vocab(sentences)
+            corpus = ensure_corpus(paths["data_dir"], paths.get("extra_data_dirs", []))
+            tokenizer.build_vocab(corpus["sentences"], sources=corpus["sources"])
             tokenizer.save(vocab_cache)
             print(f"Vocab built: {tokenizer.vocab_size} tokens", flush=True)
         barrier.wait()
         if not is_main:
             tokenizer.load(vocab_cache)
+    if corpus:
+        sentences = corpus["sentences"]
 
     if is_main:
         dataset = WordDataset(sentences, tokenizer, model_cfg["seq_length"],
