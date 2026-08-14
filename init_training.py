@@ -84,8 +84,8 @@ def main():
         draft = json.load(f)
 
     m = draft["model"]
-    vocab_cfg = m.get("vocab", {})
-    td = draft.get("training-defaults", {})
+    vocab_cfg = draft.get("tokenizer", m.get("vocab", {}))
+    td = draft.get("training-defaults", draft.get("training", {}))
     paths = draft.get("paths", {})
 
     # Model params
@@ -225,9 +225,11 @@ def main():
         "epochs": epochs_rec,
         "batch_size": td.get("batch_size", 256),
         "lr": td.get("lr", new_lr),
-        "checkpoint_every": max(1, epochs_rec // 5),
-        "checkpoint_interval": td.get("checkpoint_interval", 10000),
-        "checkpoint_every_min": td.get("checkpoint_every_min", 30)
+        "checkpoint": {
+            "every_batch": td.get("checkpoint_interval", 10000),
+            "every_min": td.get("checkpoint_every_min", 30),
+            "every_epoch": max(1, epochs_rec // 5),
+        },
     }
 
     # Remove model-level keys that belong in model
@@ -264,7 +266,7 @@ def main():
     print(f"    lr:        {new_lr}")
     print(f"    batch_size:{training['batch_size']}")
     print(f"    vocab:     {new_vocab}")
-    print(f"    ckpt:      every {training['checkpoint_every']} epochs / {training['checkpoint_interval']} batches / {training['checkpoint_every_min']} min")
+    print(f"    ckpt:      every {training['checkpoint']['every_epoch']} epochs / {training['checkpoint']['every_batch']} batches / {training['checkpoint']['every_min']} min")
     print(f"")
 
     # Embedding table info

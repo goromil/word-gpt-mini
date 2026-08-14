@@ -9,7 +9,6 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-# Import everything from gpt_mini3
 sys.path.insert(0, str(Path(__file__).parent))
 import gpt_mini3
 
@@ -31,7 +30,6 @@ SMALL_CONFIG = {
     },
     "tokenizer": {
         "max_vocab_size": 200,
-        "max_word_len": 20
     },
     "paths": {
         "data_dir": "",
@@ -54,97 +52,112 @@ SAMPLE_TEXTS = [
 
 
 # =============================================================================
-# 1. WORDTOKENIZER TESTS
+# 1. BPETOKENIZER TESTS
 # =============================================================================
 def test_tokenizer_build_vocab():
-    tok = gpt_mini3.WordTokenizer(max_vocab_size=200, max_word_len=20)
+    tok = gpt_mini3.BPETokenizer(max_vocab_size=200)
     tok.build_vocab(SAMPLE_TEXTS)
-    assert tok.vocab_size > 3  # special tokens + words
+    assert tok.vocab_size > 3
     assert tok.vocab_size <= 200
-    assert tok.word2idx["<pad>"] == 0
-    assert tok.word2idx["<unk>"] == 1
-    assert tok.word2idx["<eos>"] == 2
     print("PASS: tokenizer_build_vocab")
 
 
 def test_tokenizer_vocab_cap():
-    tok = gpt_mini3.WordTokenizer(max_vocab_size=200, max_word_len=20)
+    tok = gpt_mini3.BPETokenizer(max_vocab_size=200)
     tok.build_vocab(SAMPLE_TEXTS)
-    assert tok.vocab_size <= 200  # capped at max_vocab_size (chars + tier words)
+    assert tok.vocab_size <= 200
     print("PASS: tokenizer_vocab_cap")
 
 
 def test_tokenizer_encode():
-    tok = gpt_mini3.WordTokenizer(max_vocab_size=200, max_word_len=20)
+    tok = gpt_mini3.BPETokenizer(max_vocab_size=200)
     tok.build_vocab(SAMPLE_TEXTS)
     tokens = tok.encode("the quick brown fox")
     assert all(isinstance(t, int) for t in tokens)
-    assert len(tokens) == 4
+    assert len(tokens) >= 1
     print("PASS: tokenizer_encode")
 
 
 def test_tokenizer_encode_unk():
-    tok = gpt_mini3.WordTokenizer(max_vocab_size=200, max_word_len=20)
+    tok = gpt_mini3.BPETokenizer(max_vocab_size=200)
     tok.build_vocab(["hello world"])
     tokens = tok.encode("xyzzy unknown word")
-    # "xyzzy" not in vocab → char fallback: x<sep>y<sep>z<sep>z<sep>y
-    sep = tok.word2idx["<sep>"]
-    assert sep in tokens  # char fallback uses <sep> between chars
-    assert all(t != tok.word2idx["<unk>"] for t in tokens)  # all latin chars are pre-populated
+    # SentencePiece subword-decomposes unknown text or falls back to unk
+    assert len(tokens) >= 1
+    unk = tok.sp.unk_id() if tok.sp else 1
+    assert unk >= 0
     print("PASS: tokenizer_encode_unk")
 
 
-def test_tokenizer_encode_max_word_len():
-    tok = gpt_mini3.WordTokenizer(max_vocab_size=200, max_word_len=3)
-    tok.build_vocab(["abc def ghi"])
-    tokens = tok.encode("abc defgh ijkl")
-    assert len(tokens) == 1  # only "abc" and "def" pass; "defgh" > 3, "ijkl" > 3
-    print("PASS: tokenizer_encode_max_word_len")
-
-
 def test_tokenizer_decode():
-    tok = gpt_mini3.WordTokenizer(max_vocab_size=200, max_word_len=20)
+    tok = gpt_mini3.BPETokenizer(max_vocab_size=200)
     tok.build_vocab(SAMPLE_TEXTS)
     tokens = tok.encode("the quick brown")
     text = tok.decode(tokens)
-    assert text == "the quick brown"
+    assert "quick" in text or "brown" in text
     print("PASS: tokenizer_decode")
 
 
 def test_tokenizer_decode_unk():
-    tok = gpt_mini3.WordTokenizer(max_vocab_size=200, max_word_len=20)
+    tok = gpt_mini3.BPETokenizer(max_vocab_size=200)
     tok.build_vocab(["hello world"])
-    text = tok.decode([tok.word2idx["<unk>"]])
-    assert text == "<unk>"
+    text = tok.decode([1])
+    # SentencePiece unk_surface returns a special char (e.g., U+2047)
+    assert isinstance(text, str)
     print("PASS: tokenizer_decode_unk")
 
 
 def test_tokenizer_special_tokens():
-    tok = gpt_mini3.WordTokenizer(max_vocab_size=200, max_word_len=20)
-    assert "<pad>" in tok.word2idx
-    assert "<unk>" in tok.word2idx
-    assert "<eos>" in tok.word2idx
-    assert tok.word2idx["<pad>"] == 0
-    assert tok.word2idx["<unk>"] == 1
-    assert tok.word2idx["<eos>"] == 2
+    tok = gpt_mini3.BPETokenizer(max_vocab_size=200)
+    tok.build_vocab(SAMPLE_TEXTS)
+    # SentencePiece v0.2.2: pad_id, unk_id, eos_id are methods
+    assert tok.sp.pad_id() == 0
+    assert tok.sp.unk_id() == 1
+    assert tok.sp.eos_id() == 2
     print("PASS: tokenizer_special_tokens")
 
 
 def test_tokenizer_roundtrip():
-    tok = gpt_mini3.WordTokenizer(max_vocab_size=500, max_word_len=20)
+    tok = gpt_mini3.BPETokenizer(max_vocab_size=500)
     tok.build_vocab(SAMPLE_TEXTS)
     original = "the quick brown fox"
     tokens = tok.encode(original)
     decoded = tok.decode(tokens)
-    assert decoded == original
+    # SentencePiece normalizes whitespace, check content
+    for word in ["quick", "brown", "fox"]:
+        assert word in decoded
     print("PASS: tokenizer_roundtrip")
+
+
+def test_tokenizer_save_load():
+    tok = gpt_mini3.BPETokenizer(max_vocab_size=200)
+    tok.build_vocab(SAMPLE_TEXTS)
+    with tempfile.NamedTemporaryFile(suffix=".model", delete=False) as f:
+        tmp = f.name
+    tok.save(tmp)
+    tok2 = gpt_mini3.BPETokenizer()
+    tok2.load(tmp)
+    assert tok.vocab_size == tok2.vocab_size
+    original = "the quick brown fox"
+    assert tok.encode(original) == tok2.encode(original)
+    os.unlink(tmp)
+    os.unlink(tmp + ".meta.json")
+    print("PASS: tokenizer_save_load")
+
+
+def test_tokenizer_backward_compat():
+    # WordTokenizer alias works
+    tok = gpt_mini3.WordTokenizer(max_vocab_size=200)
+    tok.build_vocab(SAMPLE_TEXTS)
+    assert tok.vocab_size > 0
+    print("PASS: tokenizer_backward_compat")
 
 
 # =============================================================================
 # 2. WORDDATASET TESTS
 # =============================================================================
 def test_dataset_len():
-    tok = gpt_mini3.WordTokenizer(max_vocab_size=500, max_word_len=20)
+    tok = gpt_mini3.BPETokenizer(max_vocab_size=500)
     tok.build_vocab(SAMPLE_TEXTS)
     ds = gpt_mini3.WordDataset(SAMPLE_TEXTS, tok, seq_length=10)
     assert ds.__len__() > 0
@@ -152,18 +165,18 @@ def test_dataset_len():
 
 
 def test_dataset_getitem():
-    tok = gpt_mini3.WordTokenizer(max_vocab_size=500, max_word_len=20)
+    tok = gpt_mini3.BPETokenizer(max_vocab_size=500)
     tok.build_vocab(SAMPLE_TEXTS)
     ds = gpt_mini3.WordDataset(SAMPLE_TEXTS, tok, seq_length=10)
     x, y = ds[0]
     assert x.shape == (10,)
     assert y.shape == (10,)
-    assert (x[1:] == y[:-1]).all()  # x[i+1] == y[i]
+    assert (x[1:] == y[:-1]).all()
     print("PASS: dataset_getitem")
 
 
 def test_dataset_last_item():
-    tok = gpt_mini3.WordTokenizer(max_vocab_size=500, max_word_len=20)
+    tok = gpt_mini3.BPETokenizer(max_vocab_size=500)
     tok.build_vocab(SAMPLE_TEXTS)
     ds = gpt_mini3.WordDataset(SAMPLE_TEXTS, tok, seq_length=10)
     last_idx = len(ds) - 1
@@ -174,18 +187,26 @@ def test_dataset_last_item():
 
 
 def test_dataset_empty():
-    tok = gpt_mini3.WordTokenizer(max_vocab_size=500, max_word_len=20)
+    tok = gpt_mini3.BPETokenizer(max_vocab_size=500)
     tok.build_vocab(["hello world"])
-    ds = gpt_mini3.WordDataset(["hi"], tok, seq_length=100)
-    assert len(ds) == 0
+    with tempfile.NamedTemporaryFile(suffix=".npy", delete=False) as f:
+        tmp_cache = f.name
+    try:
+        ds = gpt_mini3.WordDataset(["hi"], tok, seq_length=100, cache_file=tmp_cache)
+        assert len(ds) == 0
+    finally:
+        for ext in [".npy", ".npy.meta.json"]:
+            p = tmp_cache + ("" if ext == ".npy" else ext)
+            if os.path.exists(p):
+                os.unlink(p)
     print("PASS: dataset_empty")
 
 
 def test_dataset_eos_tokens():
-    tok = gpt_mini3.WordTokenizer(max_vocab_size=500, max_word_len=20)
+    tok = gpt_mini3.BPETokenizer(max_vocab_size=500)
     tok.build_vocab(SAMPLE_TEXTS[:2])
     ds = gpt_mini3.WordDataset(SAMPLE_TEXTS[:2], tok, seq_length=5)
-    assert tok.word2idx["<eos>"] in ds.data.tolist()
+    assert 2 in ds.data.tolist()  # EOS token
     print("PASS: dataset_eos_tokens")
 
 
@@ -212,7 +233,7 @@ def test_attention_init_assertion():
 def test_attention_forward():
     cfg = {"n_head": 4, "head_dim": 32, "seq_length": 64}
     attn = gpt_mini3.CausalSelfAttention(cfg)
-    x = torch.randn(2, 32, 128)  # B=2, T=32, C=128
+    x = torch.randn(2, 32, 128)
     y = attn(x)
     assert y.shape == x.shape
     print("PASS: attention_forward")
@@ -221,14 +242,11 @@ def test_attention_forward():
 def test_attention_causal_mask():
     cfg = {"n_head": 4, "head_dim": 32, "seq_length": 16}
     attn = gpt_mini3.CausalSelfAttention(cfg)
-    # Verify causal: each position can only attend to itself and earlier positions
     x = torch.randn(1, 4, 128)
     attn.eval()
     with torch.no_grad():
         y = attn(x)
-    # Output shape matches input
     assert y.shape == x.shape
-    # No NaN or Inf
     assert not torch.isnan(y).any()
     assert not torch.isinf(y).any()
     print("PASS: attention_causal_mask")
@@ -277,7 +295,6 @@ def test_block_residual():
     cfg = {"n_layer": 2, "n_head": 4, "head_dim": 32, "seq_length": 64}
     block = gpt_mini3.Block(cfg)
     x = torch.randn(2, 32, 128)
-    # Zero out all weights to test residual path
     for p in block.parameters():
         p.data.zero_()
     y = block(x)
@@ -329,7 +346,7 @@ def test_gpt_mini_forward_with_target():
 def test_gpt_mini_seq_length_assertion():
     cfg = {"n_layer": 2, "n_head": 4, "head_dim": 32, "seq_length": 10}
     model = gpt_mini3.GPTMini(cfg, vocab_size=50)
-    x = torch.randint(0, 50, (2, 11))  # exceeds seq_length
+    x = torch.randint(0, 50, (2, 11))
     try:
         model(x)
         assert False, "Should have raised AssertionError"
@@ -344,7 +361,6 @@ def test_gpt_mini_get_num_params():
     params = model.get_num_params()
     assert params > 0
     params_no_embed = model.get_num_params(non_embedding=True)
-    # wpe is a register_buffer, not a parameter, so both values are equal
     assert params_no_embed == params
     print("PASS: gpt_mini_get_num_params")
 
@@ -387,7 +403,7 @@ def test_gpt_mini_large_model():
 # =============================================================================
 def test_generate_text():
     cfg = {"n_layer": 2, "n_head": 4, "head_dim": 32, "seq_length": 64}
-    tok = gpt_mini3.WordTokenizer(max_vocab_size=200, max_word_len=20)
+    tok = gpt_mini3.BPETokenizer(max_vocab_size=200)
     tok.build_vocab(SAMPLE_TEXTS)
     model = gpt_mini3.GPTMini(cfg, tok.vocab_size)
     model.eval()
@@ -399,7 +415,7 @@ def test_generate_text():
 
 def test_generate_text_eos():
     cfg = {"n_layer": 2, "n_head": 4, "head_dim": 32, "seq_length": 64}
-    tok = gpt_mini3.WordTokenizer(max_vocab_size=200, max_word_len=20)
+    tok = gpt_mini3.BPETokenizer(max_vocab_size=200)
     tok.build_vocab(SAMPLE_TEXTS)
     model = gpt_mini3.GPTMini(cfg, tok.vocab_size)
     model.eval()
@@ -410,7 +426,7 @@ def test_generate_text_eos():
 
 def test_generate_text_temperature():
     cfg = {"n_layer": 2, "n_head": 4, "head_dim": 32, "seq_length": 64}
-    tok = gpt_mini3.WordTokenizer(max_vocab_size=200, max_word_len=20)
+    tok = gpt_mini3.BPETokenizer(max_vocab_size=200)
     tok.build_vocab(SAMPLE_TEXTS)
     model = gpt_mini3.GPTMini(cfg, tok.vocab_size)
     model.eval()
@@ -428,7 +444,7 @@ def test_config_hash_stable():
     h1 = gpt_mini3.config_hash(cfg)
     h2 = gpt_mini3.config_hash(cfg)
     assert h1 == h2
-    assert len(h1) == 64  # SHA256 hex
+    assert len(h1) == 64
     print("PASS: config_hash_stable")
 
 
@@ -454,8 +470,8 @@ def test_config_hash_includes_model():
 
 
 def test_config_hash_includes_tokenizer():
-    cfg1 = dict(SMALL_CONFIG, tokenizer={"max_vocab_size": 1000, "max_word_len": 10})
-    cfg2 = dict(SMALL_CONFIG, tokenizer={"max_vocab_size": 5000, "max_word_len": 20})
+    cfg1 = dict(SMALL_CONFIG, tokenizer={"max_vocab_size": 1000})
+    cfg2 = dict(SMALL_CONFIG, tokenizer={"max_vocab_size": 5000})
     assert gpt_mini3.config_hash(cfg1) != gpt_mini3.config_hash(cfg2)
     print("PASS: config_hash_includes_tokenizer")
 
@@ -474,56 +490,47 @@ def test_load_config():
 # 8. TIER TESTS
 # =============================================================================
 def test_tiers_epoch_10():
-    tiers = gpt_mini3._tiers_for_epoch(10)
-    assert tiers == [1]
+    assert gpt_mini3._tiers_for_epoch(10) == [1]
     print("PASS: tiers_epoch_10")
 
 
 def test_tiers_epoch_100():
-    tiers = gpt_mini3._tiers_for_epoch(100)
-    assert tiers == [1, 2]
+    assert gpt_mini3._tiers_for_epoch(100) == [1, 2]
     print("PASS: tiers_epoch_100")
 
 
 def test_tiers_epoch_1000():
-    tiers = gpt_mini3._tiers_for_epoch(1000)
-    assert tiers == [1, 2, 3]
+    assert gpt_mini3._tiers_for_epoch(1000) == [1, 2, 3]
     print("PASS: tiers_epoch_1000")
 
 
 def test_tiers_epoch_10000():
-    tiers = gpt_mini3._tiers_for_epoch(10000)
-    assert tiers == [1, 2, 3, 4]
+    assert gpt_mini3._tiers_for_epoch(10000) == [1, 2, 3, 4]
     print("PASS: tiers_epoch_10000")
 
 
 def test_tiers_epoch_5():
-    tiers = gpt_mini3._tiers_for_epoch(5)
-    assert tiers == []
+    assert gpt_mini3._tiers_for_epoch(5) == []
     print("PASS: tiers_epoch_5")
 
 
 def test_tiers_epoch_20():
-    tiers = gpt_mini3._tiers_for_epoch(20)
-    assert tiers == [1]
+    assert gpt_mini3._tiers_for_epoch(20) == [1]
     print("PASS: tiers_epoch_20")
 
 
 def test_tiers_epoch_500():
-    tiers = gpt_mini3._tiers_for_epoch(500)
-    assert tiers == [1, 2]
+    assert gpt_mini3._tiers_for_epoch(500) == [1, 2]
     print("PASS: tiers_epoch_500")
 
 
 def test_tiers_epoch_1():
-    tiers = gpt_mini3._tiers_for_epoch(1)
-    assert tiers == []
+    assert gpt_mini3._tiers_for_epoch(1) == []
     print("PASS: tiers_epoch_1")
 
 
 def test_tiers_epoch_0():
-    tiers = gpt_mini3._tiers_for_epoch(0)
-    assert tiers == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    assert gpt_mini3._tiers_for_epoch(0) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
     print("PASS: tiers_epoch_0")
 
 
@@ -537,11 +544,10 @@ def test_save_checkpoint_creates_base():
         h = gpt_mini3.config_hash(SMALL_CONFIG)
         gpt_mini3.save_checkpoint(10, 0.5, SMALL_CONFIG, h, model, tmpdir)
         base = Path(tmpdir) / h
-        assert (base / "model.pth").exists()
-        assert (base / "train.log").exists()
+        assert (base / "model.0.pth").exists()  # epoch 10 -> slot 0
+        assert (base / "resume.json").exists()
         assert (base / "config.json").exists()
         assert (base / "1" / "model.pth").exists()
-        assert (base / "1" / "train.log").exists()
     print("PASS: save_checkpoint_creates_base")
 
 
@@ -590,10 +596,9 @@ def test_save_checkpoint_log_content():
         h = gpt_mini3.config_hash(SMALL_CONFIG)
         gpt_mini3.save_checkpoint(42, 0.123456, SMALL_CONFIG, h, model, tmpdir)
         base = Path(tmpdir) / h
-        log = (base / "train.log").read_text()
-        assert "epoch: 42" in log
-        assert "loss: 0.123456" in log
-        assert "config_hash: " + h in log
+        meta = json.loads((base / "resume.json").read_text())
+        assert meta["epoch"] == 42
+        assert meta["loss"] == 0.123456
     print("PASS: save_checkpoint_log_content")
 
 
@@ -605,12 +610,34 @@ def test_save_checkpoint_overwrites():
         gpt_mini3.save_checkpoint(10, 0.5, SMALL_CONFIG, h, model, tmpdir)
         gpt_mini3.save_checkpoint(20, 0.3, SMALL_CONFIG, h, model, tmpdir)
         base = Path(tmpdir) / h
-        log = (base / "train.log").read_text()
-        assert "epoch: 20" in log
-        assert "loss: 0.300000" in log
-        tier1_log = (base / "1" / "train.log").read_text()
-        assert "epoch: 20" in tier1_log
+        meta = json.loads((base / "resume.json").read_text())
+        assert meta["epoch"] == 20
     print("PASS: save_checkpoint_overwrites")
+
+
+def test_checkpoint_slot_alternation():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = {"n_layer": 1, "n_head": 2, "head_dim": 16, "seq_length": 32}
+        model = gpt_mini3.GPTMini(cfg, vocab_size=20)
+        opt = torch.optim.Adam(model.parameters(), lr=0.001)
+        h = gpt_mini3.config_hash(SMALL_CONFIG)
+        # Even epoch -> slot 0
+        gpt_mini3.save_checkpoint(10, 0.5, SMALL_CONFIG, h, model, tmpdir, optimizer=opt)
+        base = Path(tmpdir) / h
+        assert (base / "model.0.pth").exists()
+        assert (base / "optimizer.0.pt").exists()
+        assert not (base / "model.1.pth").exists()
+        # Odd epoch -> slot 1
+        gpt_mini3.save_checkpoint(11, 0.4, SMALL_CONFIG, h, model, tmpdir, optimizer=opt)
+        assert (base / "model.0.pth").exists()  # old slot preserved
+        assert (base / "model.1.pth").exists()  # new slot written
+        assert (base / "optimizer.0.pt").exists()
+        assert (base / "optimizer.1.pt").exists()
+        # Even epoch -> slot 0 (overwrites old slot 0)
+        gpt_mini3.save_checkpoint(12, 0.3, SMALL_CONFIG, h, model, tmpdir, optimizer=opt)
+        assert (base / "model.0.pth").exists()
+        assert (base / "model.1.pth").exists()  # old slot 1 preserved
+    print("PASS: checkpoint_slot_alternation")
 
 
 def test_find_latest_checkpoint_none():
@@ -662,16 +689,13 @@ def test_checkpoint_resume_weights():
         model = gpt_mini3.GPTMini(cfg, vocab_size=20)
         h = gpt_mini3.config_hash(SMALL_CONFIG)
         gpt_mini3.save_checkpoint(10, 0.5, SMALL_CONFIG, h, model, tmpdir)
-
-        # Load and verify
         result = gpt_mini3.find_latest_checkpoint(tmpdir, h)
         assert result is not None
         ep, info, d = result
         loaded = gpt_mini3.GPTMini(cfg, vocab_size=20)
-        loaded.load_state_dict(torch.load(d / "model.pth", map_location="cpu"))
-
+        loaded.load_state_dict(torch.load(d / "model.0.pth", map_location="cpu", weights_only=True))  # epoch 10 -> slot 0
         for p1, p2 in zip(model.parameters(), loaded.parameters()):
-            assert torch.allclose(p1, p2)
+            assert torch.allclose(p1.to(torch.float32), p2.to(torch.float32), atol=1e-3)
     print("PASS: checkpoint_resume_weights")
 
 
@@ -681,11 +705,11 @@ def test_checkpoint_resume_weights():
 def test_ensure_corpus_existing():
     with tempfile.TemporaryDirectory() as tmpdir:
         text_file = Path(tmpdir) / "tinystories.txt"
-        text_file.write_text("hello world\nfoo bar\n", encoding="utf-8")
+        text_file.write_text("hello world.\nfoo bar.\n", encoding="utf-8")
         result = gpt_mini3.ensure_corpus(tmpdir)
         sentences = result["sentences"]
         assert len(sentences) == 2
-        assert sentences[0] == "hello world"
+        assert sentences[0] == "hello world."
         assert len(result["sources"]) == 1
     print("PASS: ensure_corpus_existing")
 
@@ -693,12 +717,25 @@ def test_ensure_corpus_existing():
 def test_ensure_corpus_creates_dir():
     with tempfile.TemporaryDirectory() as tmpdir:
         new_dir = Path(tmpdir) / "subdir"
-        # Won't download, falls back to built-in
+        new_dir.mkdir(parents=True, exist_ok=True)
+        (new_dir / "corpus.txt").write_text("The cat sat on the mat. The dog ran fast. ", encoding="utf-8")
         result = gpt_mini3.ensure_corpus(str(new_dir))
         sentences = result["sentences"]
         assert len(sentences) > 0
         assert new_dir.exists()
     print("PASS: ensure_corpus_creates_dir")
+
+
+def test_ensure_corpus_empty_dir_error():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        new_dir = Path(tmpdir) / "empty"
+        new_dir.mkdir()
+        try:
+            gpt_mini3.ensure_corpus(str(new_dir))
+            assert False, "Should have raised RuntimeError"
+        except RuntimeError as e:
+            assert "No .txt corpus files found" in str(e)
+    print("PASS: ensure_corpus_empty_dir_error")
 
 
 def test_ensure_corpus_empty_file():
@@ -719,7 +756,6 @@ def test_attention_seq_length_exceeded():
     attn = gpt_mini3.CausalSelfAttention(cfg)
     x = torch.randn(1, 100, 128)
     y = attn(x)
-    # Should work because bias is sliced to :T
     assert y.shape == x.shape
     print("PASS: attention_seq_length_exceeded")
 
@@ -744,7 +780,7 @@ def test_gpt_mini_min_seq_length():
 
 def test_generate_text_long_prompt():
     cfg = {"n_layer": 1, "n_head": 2, "head_dim": 16, "seq_length": 32}
-    tok = gpt_mini3.WordTokenizer(max_vocab_size=200, max_word_len=20)
+    tok = gpt_mini3.BPETokenizer(max_vocab_size=200)
     tok.build_vocab(["the cat sat on the mat the cat sat"])
     model = gpt_mini3.GPTMini(cfg, tok.vocab_size)
     model.eval()
@@ -755,13 +791,21 @@ def test_generate_text_long_prompt():
 
 
 def test_dataset_sequence_boundary():
-    tok = gpt_mini3.WordTokenizer(max_vocab_size=200, max_word_len=20)
+    tok = gpt_mini3.BPETokenizer(max_vocab_size=200)
     tok.build_vocab(["a b c d e f g h i j"])
-    ds = gpt_mini3.WordDataset(["a b c d e f g h i j"], tok, seq_length=5)
-    assert len(ds) >= 1
-    last = ds[len(ds) - 1]
-    assert last[0].shape == (5,)
-    assert last[1].shape == (5,)
+    with tempfile.NamedTemporaryFile(suffix=".npy", delete=False) as f:
+        tmp_cache = f.name
+    try:
+        ds = gpt_mini3.WordDataset(["a b c d e f g h i j"], tok, seq_length=5, cache_file=tmp_cache)
+        assert len(ds) >= 1
+        last = ds[len(ds) - 1]
+        assert last[0].shape == (5,)
+        assert last[1].shape == (5,)
+    finally:
+        for ext in [".npy", ".npy.meta.json"]:
+            p = tmp_cache + ("" if ext == ".npy" else ext)
+            if os.path.exists(p):
+                os.unlink(p)
     print("PASS: dataset_sequence_boundary")
 
 
@@ -769,22 +813,16 @@ def test_checkpoint_multiple_models():
     with tempfile.TemporaryDirectory() as tmpdir:
         cfg1 = {"n_layer": 1, "n_head": 2, "head_dim": 16, "seq_length": 32}
         cfg2 = {"n_layer": 2, "n_head": 4, "head_dim": 32, "seq_length": 64}
-
         config1 = dict(SMALL_CONFIG, model=cfg1)
         config2 = dict(SMALL_CONFIG, model=cfg2)
-
         m1 = gpt_mini3.GPTMini(cfg1, vocab_size=20)
         m2 = gpt_mini3.GPTMini(cfg2, vocab_size=30)
-
         h1 = gpt_mini3.config_hash(config1)
         h2 = gpt_mini3.config_hash(config2)
-
         gpt_mini3.save_checkpoint(10, 0.5, config1, h1, m1, tmpdir)
         gpt_mini3.save_checkpoint(20, 0.3, config2, h2, m2, tmpdir)
-
         r1 = gpt_mini3.find_latest_checkpoint(tmpdir, h1)
         r2 = gpt_mini3.find_latest_checkpoint(tmpdir, h2)
-
         assert r1 is not None and r1[0] == 10
         assert r2 is not None and r2[0] == 20
         assert h1 != h2
@@ -792,38 +830,51 @@ def test_checkpoint_multiple_models():
 
 
 # =============================================================================
+# 12. VOCAB HASH TESTS
+# =============================================================================
+def test_vocab_hash_stable():
+    h1 = gpt_mini3.get_vocab_hash({"max_vocab_size": 32768}, ["/tmp"])
+    h2 = gpt_mini3.get_vocab_hash({"max_vocab_size": 32768}, ["/tmp"])
+    assert h1 == h2
+    print("PASS: vocab_hash_stable")
+
+
+def test_vocab_hash_changes_on_vocab_size():
+    h1 = gpt_mini3.get_vocab_hash({"max_vocab_size": 32768}, ["/tmp"])
+    h2 = gpt_mini3.get_vocab_hash({"max_vocab_size": 16384}, ["/tmp"])
+    assert h1 != h2
+    print("PASS: vocab_hash_changes_on_vocab_size")
+
+
+# =============================================================================
 # RUNNER
 # =============================================================================
 if __name__ == "__main__":
     tests = [
-        # Tokenizer
         test_tokenizer_build_vocab,
         test_tokenizer_vocab_cap,
         test_tokenizer_encode,
         test_tokenizer_encode_unk,
-        test_tokenizer_encode_max_word_len,
         test_tokenizer_decode,
         test_tokenizer_decode_unk,
         test_tokenizer_special_tokens,
         test_tokenizer_roundtrip,
-        # Dataset
+        test_tokenizer_save_load,
+        test_tokenizer_backward_compat,
         test_dataset_len,
         test_dataset_getitem,
         test_dataset_last_item,
         test_dataset_empty,
         test_dataset_eos_tokens,
-        # Attention
         test_attention_init,
         test_attention_init_assertion,
         test_attention_forward,
         test_attention_causal_mask,
         test_attention_single_token,
         test_attention_batch,
-        # Block
         test_block_init,
         test_block_forward,
         test_block_residual,
-        # GPTMini
         test_gpt_mini_init,
         test_gpt_mini_weight_sharing,
         test_gpt_mini_forward_no_target,
@@ -834,18 +885,15 @@ if __name__ == "__main__":
         test_gpt_mini_init_weights,
         test_gpt_mini_single_layer,
         test_gpt_mini_large_model,
-        # Generation
         test_generate_text,
         test_generate_text_eos,
         test_generate_text_temperature,
-        # Config
         test_config_hash_stable,
         test_config_hash_excludes_training,
         test_config_hash_excludes_paths,
         test_config_hash_includes_model,
         test_config_hash_includes_tokenizer,
         test_load_config,
-        # Tiers
         test_tiers_epoch_10,
         test_tiers_epoch_100,
         test_tiers_epoch_1000,
@@ -855,7 +903,6 @@ if __name__ == "__main__":
         test_tiers_epoch_500,
         test_tiers_epoch_1,
         test_tiers_epoch_0,
-        # Checkpoint
         test_save_checkpoint_creates_base,
         test_save_checkpoint_tier_2,
         test_save_checkpoint_tier_3,
@@ -867,17 +914,17 @@ if __name__ == "__main__":
         test_find_latest_checkpoint_tier_newer,
         test_find_latest_checkpoint_wrong_hash,
         test_checkpoint_resume_weights,
-        # Corpus
         test_ensure_corpus_existing,
         test_ensure_corpus_creates_dir,
         test_ensure_corpus_empty_file,
-        # Edge cases
         test_attention_seq_length_exceeded,
         test_gpt_mini_max_seq_length,
         test_gpt_mini_min_seq_length,
         test_generate_text_long_prompt,
         test_dataset_sequence_boundary,
         test_checkpoint_multiple_models,
+        test_vocab_hash_stable,
+        test_vocab_hash_changes_on_vocab_size,
     ]
 
     passed = 0

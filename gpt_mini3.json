@@ -1,19 +1,21 @@
 {
   "model": {
-    "n_layer": 30,
-    "n_head": 8,
-    "head_dim": 192,
-    "seq_length": 64
+    "n_layer": 36,
+    "n_head": 20,
+    "head_dim": 64,
+    "seq_length": 256
   },
   "training": {
     "epochs": 31,
-    "batch_size": 64,
+    "batch_size": 16,
     "lr": 0.0002,
-    "checkpoint_every": 1,
-    "checkpoint_interval": 1000,
-    "checkpoint_every_min": 30,
+    "checkpoint": {
+      "every_batch": 250,
+      "every_min": 30,
+      "every_epoch": 1
+    },
     "sync": {
-      "gradient_accumulation_steps": 1024,
+      "gradient_accumulation_steps": 512,
       "method": "cpu",
       "chunks": 4
     }

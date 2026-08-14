@@ -320,9 +320,9 @@ class Trainer:
         self.grad_sync = grad_sync
         self.barrier = barrier
 
-        self.ckpt_interval = train_cfg.get("checkpoint_interval", 0)
-        self.ckpt_every_min = train_cfg.get("checkpoint_every_min", 0)
-        self.ckpt_every = train_cfg.get("checkpoint_every", 1)
+        self.ckpt_every_batch = train_cfg.get("checkpoint", {}).get("every_batch", train_cfg.get("checkpoint_interval", 0))
+        self.ckpt_every_min = train_cfg.get("checkpoint", {}).get("every_min", train_cfg.get("checkpoint_every_min", 0))
+        self.ckpt_every = train_cfg.get("checkpoint", {}).get("every_epoch", train_cfg.get("checkpoint_every", 1))
         self.grad_accum = train_cfg.get("gradient_accumulation_steps", 1)
         self.use_bf16 = torch.cuda.is_bf16_supported()
         self.log_interval = train_cfg.get("log_interval", 100)
@@ -381,11 +381,32 @@ class Trainer:
             if self.rank == 0:
                 print(f"Resuming from {ckpt_dir} (epoch {ep}, loss {info['loss']:.6f}, "
                       f"global_batch {self.global_batch})", flush=True)
-            ckpt_state = torch.load(ckpt_dir / "model.pth",
+            # Determine slot from saved epoch (slot = epoch & 1)
+            slot = ep & 1
+            model_path = ckpt_dir / f"model.{slot}.pth"
+            if not model_path.exists():
+                model_path = ckpt_dir / f"model.{1 - slot}.pth"
+            if not model_path.exists():
+                model_path = ckpt_dir / "model.pth"
+            ckpt_state = torch.load(model_path,
                                     map_location=f"cuda:{self.device}")
             self.model.load_state_dict(ckpt_state)
             del ckpt_state
             torch.cuda.empty_cache()
+            # Restore optimizer state (rank 0 only)
+            opt_path = ckpt_dir / f"optimizer.{slot}.pt"
+            if not opt_path.exists():
+                opt_path = ckpt_dir / f"optimizer.{1 - slot}.pt"
+            if not opt_path.exists():
+                opt_path = ckpt_dir / "optimizer.pt"
+            if self.rank == 0 and opt_path.exists():
+                self.optimizer.load_state_dict(torch.load(opt_path, map_location=f"cuda:{self.device}"))
+                print(f"  Optimizer state restored (momentum buffers preserved)", flush=True)
+            # Advance scheduler to correct LR
+            lr = float(info.get("lr", self.train_cfg.get("lr", 0.0002)))
+            self.optimizer.param_groups[0]["lr"] = lr
+            for _ in range(ep):
+                self.scheduler.step()
 
     def _run_epoch(self, epoch: int):
         self.model.train()
@@ -419,7 +440,7 @@ class Trainer:
                       flush=True)
 
             should_ckpt = False
-            if self.ckpt_interval > 0 and self.global_batch % self.ckpt_interval == 0:
+            if self.ckpt_every_batch > 0 and self.global_batch % self.ckpt_every_batch == 0:
                 should_ckpt = True
             if self.ckpt_every_min > 0 and (time.time() - self.last_ckpt_time) >= self.ckpt_every_min * 60:
                 should_ckpt = True
@@ -442,6 +463,7 @@ class Trainer:
                           self.training_start_time)
             save_checkpoint(epoch, loss, self.combined_config, self.ckpt_hash,
                             self.model, self.paths["checkpoint_dir"],
+                            optimizer=self.optimizer,
                             extra={"global_batch": self.global_batch,
                                    "batch_size": self.train_cfg["batch_size"],
                                    "seq_length": self.model_cfg["seq_length"],

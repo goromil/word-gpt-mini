@@ -27,6 +27,7 @@ Desktop.ini
 E:/training/
 data_cache.npy
 *.npy
+*.npy.meta.json
 
 # Opencode sessions
 session-ses*.md

@@ -1,25 +1,35 @@
 {
   "model": {
-    "n_layer": 16,
-    "n_head": 6,
-    "head_dim": 128,
-    "seq_length": 64
+    "n_layer": 32,
+    "n_head": 16,
+    "head_dim": 64,
+    "seq_length": 256
   },
   "training": {
-    "epochs": 130,
-    "batch_size": 16,
+    "epochs": 31,
+    "batch_size": 64,
     "lr": 0.0002,
-    "checkpoint_every": 10,
+    "checkpoint": {
+      "every_epoch": 1,
+      "every_batch": 1000,
+      "every_min": 30
+    },
     "sync": {
-      "gradient_accumulation_steps": 1024
+      "gradient_accumulation_steps": 1024,
+      "method": "cpu",
+      "chunks": 4
     }
   },
   "tokenizer": {
-    "max_vocab_size": 10000,
+    "max_vocab_size": 32768,
     "max_word_len": 20
   },
   "paths": {
     "data_dir": "E:\\training\\data",
-    "checkpoint_dir": "E:\\training\\checkpoints"
+    "extra_data_dirs": [
+      "E:\\training\\data2\\bulgarian-corpus-33b"
+    ],
+    "checkpoint_dir": "E:\\training\\checkpoints",
+    "cache_dir": "E:\\training\\cache"
   }
 }

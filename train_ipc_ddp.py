@@ -22,7 +22,7 @@ from gpt_mini3 import (
     GPTMini, WordTokenizer, WordDataset, ensure_corpus,
     save_checkpoint, find_latest_checkpoint, generate_text, get_model_hash, get_vocab_hash,
     _write_status, _log_error,
-    _try_restore_checkpoint, _cleanup_corrupt_checkpoint,
+    _cleanup_corrupt_checkpoint,
 )
 
 
@@ -208,10 +208,11 @@ class Trainer:
         self.dataset_tokens = dataset_tokens
         self.dataset_samples = dataset_samples
 
-        # Checkpoint config
-        self.ckpt_interval = train_cfg.get("checkpoint_interval", 0)
-        self.ckpt_every_min = train_cfg.get("checkpoint_every_min", 0)
-        self.ckpt_every = train_cfg.get("checkpoint_every", 1)
+        # Checkpoint config (from 'training.checkpoint' block or legacy flat keys)
+        ckpt_cfg = train_cfg.get("checkpoint", {})
+        self.ckpt_every_batch = ckpt_cfg.get("every_batch", train_cfg.get("checkpoint_interval", 0))
+        self.ckpt_every_min = ckpt_cfg.get("every_min", train_cfg.get("checkpoint_every_min", 0))
+        self.ckpt_every = ckpt_cfg.get("every_epoch", train_cfg.get("checkpoint_every", 1))
         sync_cfg = train_cfg.get("sync", {})
         self.grad_accum = sync_cfg.get("gradient_accumulation_steps",
                       train_cfg.get("gradient_accumulation_steps", 1))
@@ -258,19 +259,19 @@ class Trainer:
         ep, info, ckpt_dir = ckpt
         self.global_batch = int(info.get("global_batch", 0))
         device_str = f"cuda:{self.device}"
+        # Determine slot from saved epoch (slot = epoch & 1)
+        slot = ep & 1
+        model_path = ckpt_dir / f"model.{slot}.pth"
+        if not model_path.exists():
+            model_path = ckpt_dir / f"model.{1 - slot}.pth"
+        if not model_path.exists():
+            model_path = ckpt_dir / "model.pth"
         try:
-            ckpt_state = torch.load(ckpt_dir / "model.pth", map_location="cpu", weights_only=True)
+            ckpt_state = torch.load(model_path, map_location="cpu", weights_only=True)
         except Exception:
-            # Corrupt checkpoint — try restoring from backup
-            if _try_restore_checkpoint(ckpt_dir):
-                if self.gpu_id == 0:
-                    print(f"Restored checkpoint from backup: {ckpt_dir}/model.pth.bak", flush=True)
-                ckpt_state = torch.load(ckpt_dir / "model.pth", map_location="cpu", weights_only=True)
-            else:
-                if self.gpu_id == 0:
-                    print(f"Checkpoint corrupt, no backup — deleting and starting fresh: {ckpt_dir}", flush=True)
-                _cleanup_corrupt_checkpoint(ckpt_dir)
-                return
+            if self.gpu_id == 0:
+                print(f"Checkpoint corrupt: {model_path}, starting fresh", flush=True)
+            return
         if self.gpu_id == 0:
             print(f"Resuming from {ckpt_dir} (epoch {ep}, loss {info['loss']:.6f}, "
                   f"global_batch {self.global_batch})", flush=True)
@@ -330,7 +331,7 @@ class Trainer:
 
             # Checkpoint at interval / time
             should_ckpt = False
-            if self.ckpt_interval > 0 and self.global_batch % self.ckpt_interval == 0:
+            if self.ckpt_every_batch > 0 and self.global_batch % self.ckpt_every_batch == 0:
                 should_ckpt = True
             if self.ckpt_every_min > 0 and (time.time() - self.last_ckpt_time) >= self.ckpt_every_min * 60:
                 should_ckpt = True
@@ -348,6 +349,7 @@ class Trainer:
                                       self.training_start_time)
                         save_checkpoint(epoch, avg, self.combined_config, self.ckpt_hash,
                                         self.unwrapped_model, self.paths["checkpoint_dir"],
+                                        optimizer=self.optimizer,
                                         extra={"global_batch": self.global_batch,
                                                 "batch_size": self.train_cfg["batch_size"],
                                                 "seq_length": self.model_cfg["seq_length"],
@@ -373,6 +375,7 @@ class Trainer:
                           self.training_start_time)
             save_checkpoint(epoch, loss, self.combined_config, self.ckpt_hash,
                             self.unwrapped_model, self.paths["checkpoint_dir"],
+                            optimizer=self.optimizer,
                             extra={"global_batch": self.global_batch,
                                     "batch_size": self.train_cfg["batch_size"],
                                     "seq_length": self.model_cfg["seq_length"],

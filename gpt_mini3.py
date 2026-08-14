@@ -32,45 +32,145 @@ def config_hash(cfg):
 # =============================================================================
 # 2. DATA: Wikipedia download + word-level tokenization
 # =============================================================================
-class WordTokenizer:
-    def __init__(self, max_vocab_size: int = 20000, max_word_len: int = 20):
+class BPETokenizer:
+    """BPE tokenizer using SentencePiece with tier tracking."""
+
+    def __init__(self, max_vocab_size: int = 32768, max_word_len: int = None):
         self.max_vocab_size = max_vocab_size
-        self.max_word_len = max_word_len
         self._sources = None
         self._tier_ratios = None
-        self._char_slots = 0
-        # Reserved tokens
-        self.word2idx = {"<pad>": 0, "<unk>": 1, "<eos>": 2, "<sep>": 3}
-        self.idx2word = {0: "<pad>", 1: "<unk>", 2: "<eos>", 3: "<sep>"}
-        self._populate_chars()
-        self.vocab_size = len(self.word2idx)
+        self.sp = None
+        self.word2idx = {"<pad>": 0, "<unk>": 1, "<eos>": 2}
+        self.vocab_size = 3
 
-    def _populate_chars(self):
-        chars = ""
-        chars += "abcdefghijklmnopqrstuvwxyz"
-        chars += "абвгдежзийклмнопрстуфхцчшщъыьэюяё"
-        chars += "0123456789"
-        chars += "'-"
-        for ch in chars:
-            if ch not in self.word2idx:
-                idx = len(self.word2idx)
-                self.word2idx[ch] = idx
-                self.idx2word[idx] = ch
-        self._char_slots = len(chars)
+    def train(self, sources: list[dict], tier_ratios: list[float] = None):
+        import tempfile
+        import sentencepiece as spm_module
+
+        tier_ratios = tier_ratios or [0.66, 0.22, 0.12]
+
+        # Group by tier for logging
+        tier_counts = {}
+        for src in sources:
+            t = src.get("tier", 1)
+            tier_counts[t] = tier_counts.get(t, 0) + len(src.get("sentences", []))
+
+        total = sum(tier_counts.values())
+        print(f"  Building vocab from {total} texts across {len(tier_counts)} tiers", flush=True)
+        for t in sorted(tier_counts):
+            print(f"    Tier {t}: {tier_counts[t]} sentences")
+
+        # Write all text to temp file
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False,
+                                          encoding='utf-8') as f:
+            for src in sources:
+                for s in src.get("sentences", []):
+                    f.write(s + '\n')
+            train_file = f.name
+
+        model_prefix = train_file.replace('.txt', '')
+
+        # Estimate upper bound: count unique characters + whitespace-split words
+        all_text = Path(train_file).read_text(encoding='utf-8')
+        unique_chars = set(all_text)
+        unique_words = set(all_text.lower().split())
+        effective_vocab = min(self.max_vocab_size, len(unique_chars) + len(unique_words) + 10)
+        # SentencePiece needs at least 4 pieces (pad, unk, eos + 1 data piece)
+        effective_vocab = max(4, effective_vocab)
+
+        # Retry with smaller vocab if SentencePiece rejects (tiny corpus constraint)
+        attempt_vocab = effective_vocab
+        while attempt_vocab >= 4:
+            try:
+                # Suppress SentencePiece C++ logs (absl writes directly to FD 2)
+                devnull = os.open(os.devnull, os.O_WRONLY)
+                old_stderr = os.dup(2)
+                os.dup2(devnull, 2)
+                os.close(devnull)
+                try:
+                    spm_module.SentencePieceTrainer.train(
+                        input=train_file,
+                        model_prefix=model_prefix,
+                        vocab_size=attempt_vocab,
+                        character_coverage=1.0,
+                        model_type='bpe',
+                        pad_id=0,
+                        unk_id=1,
+                        eos_id=2,
+                        bos_id=-1,
+                    )
+                finally:
+                    os.dup2(old_stderr, 2)
+                    os.close(old_stderr)
+                break
+            except RuntimeError as e:
+                err = str(e)
+                if "Vocabulary size too high" in err:
+                    # Extract suggested max from error: "value <= N"
+                    import re
+                    m = re.search(r'<=\s*(\d+)', err)
+                    if m:
+                        attempt_vocab = int(m.group(1))
+                    else:
+                        attempt_vocab = max(4, attempt_vocab // 2)
+                else:
+                    raise
+
+        self.sp = spm_module.SentencePieceProcessor()
+        self.sp.Load(model_prefix + '.model')
+        self.vocab_size = self.sp.GetPieceSize()
+
+        # Build word2idx
+        self.word2idx = {"<pad>": 0, "<unk>": 1, "<eos>": 2}
+        for i in range(3, self.sp.GetPieceSize()):
+            self.word2idx[self.sp.IdToPiece(i)] = i
+
+        # Tier metadata
+        source_meta = []
+        for src in sources:
+            tier = src.get("tier", 1)
+            sample = src.get("sentences", [])[:500]
+            tokens = sum(len(self.sp.encode_as_ids(s)) for s in sample) if sample else 0
+            words = sum(len(s.split()) for s in sample) if sample else 0
+            source_meta.append({
+                "dir": src.get("dir", ""),
+                "file": src.get("file", ""),
+                "tier": tier,
+                "language": src.get("language"),
+                "sample_tokens": tokens,
+                "sample_words": words,
+            })
+        self._sources = source_meta
+        self._tier_ratios = tier_ratios
+
+        # Cleanup
+        for ext in ['.txt', '.model', '.vocab']:
+            p = model_prefix + ext
+            if os.path.exists(p):
+                os.unlink(p)
+
+        capped = "(CAP REACHED)" if self.vocab_size >= self.max_vocab_size else ""
+        print(f"Vocabulary size: {self.vocab_size} (max: {self.max_vocab_size}) {capped}", flush=True)
+
+    def build_vocab(self, texts=None, sources=None, tier_ratios=None):
+        """Backward compat alias for train()."""
+        if sources is None and texts is not None:
+            sources = [{"sentences": texts, "tier": 1, "dir": "", "file": "", "language": None}]
+        self.train(sources, tier_ratios)
+
+    def encode(self, text: str) -> list[int]:
+        return self.sp.encode_as_ids(text)
+
+    def decode(self, indices: list[int]) -> str:
+        return self.sp.decode_ids(indices)
 
     def save(self, path):
-        import json
-        Path(path).write_text(json.dumps({"word2idx": self.word2idx, "idx2word": self.idx2word,
-                                            "vocab_size": self.vocab_size,
-                                            "max_vocab_size": self.max_vocab_size,
-                                            "max_word_len": self.max_word_len}))
-        # Persist vocab meta sidecar
+        proto = self.sp.serialized_model_proto()
+        Path(path).write_bytes(proto)
         meta_path = Path(str(path) + ".meta.json")
         meta = {
             "vocab_size": self.vocab_size,
             "max_vocab_size": self.max_vocab_size,
-            "capped": self.vocab_size >= self.max_vocab_size,
-            "char_slots": self._char_slots
         }
         if self._sources:
             meta["sources"] = self._sources
@@ -79,121 +179,32 @@ class WordTokenizer:
         meta_path.write_text(json.dumps(meta, separators=(",", ":")))
 
     def load(self, path):
-        import json
-        data = json.loads(Path(path).read_text())
-        self.word2idx = data["word2idx"]
-        self.idx2word = {int(k): v for k, v in data["idx2word"].items()}
-        self.vocab_size = data["vocab_size"]
-        self.max_vocab_size = data.get("max_vocab_size", self.max_vocab_size)
-        self.max_word_len = data.get("max_word_len", self.max_word_len)
-        # Restore meta from sidecar if available
+        import sentencepiece as spm_module
+        self.sp = spm_module.SentencePieceProcessor()
+        self.sp.LoadFromSerializedProto(Path(path).read_bytes())
+        self.vocab_size = self.sp.GetPieceSize()
+        self.word2idx = {"<pad>": 0, "<unk>": 1, "<eos>": 2}
+        for i in range(3, self.sp.GetPieceSize()):
+            self.word2idx[self.sp.IdToPiece(i)] = i
         meta_path = Path(str(path) + ".meta.json")
         if meta_path.exists():
             meta = json.loads(meta_path.read_text())
-            self._char_slots = meta.get("char_slots", 0)
-            self._sources = meta.get("sources", None)
-            self._tier_ratios = meta.get("tier_ratios", None)
-
-    def build_vocab(self, texts: list[str], sources: list[dict] = None, tier_ratios: list[float] = None):
-        tier_ratios = tier_ratios or [0.66, 0.22, 0.12]
-        if sources is None:
-            # Legacy: bare list of strings, all tier 1
-            sources = [{"sentences": texts, "tier": 1, "dir": "", "file": "", "language": None}]
-        # Collect frequency per tier
-        tier_freq: dict[int, dict[str, int]] = {}
-        tier_sources: dict[int, list[dict]] = {}
-        total_texts = sum(len(s.get("sentences", [])) for s in sources)
-        processed = 0
-        for src in sources:
-            t = src.get("tier", 1)
-            if t not in tier_freq:
-                tier_freq[t] = {}
-                tier_sources[t] = []
-            for text in src.get("sentences", []):
-                processed += 1
-                if processed % 2000000 == 0 or processed == total_texts:
-                    print(f"  Building vocab: {processed}/{total_texts} texts ({processed*100//total_texts}%)", flush=True)
-                for word in self._tokenize_text(text):
-                    if len(word) > self.max_word_len:
-                        continue
-                    tier_freq[t][word] = tier_freq[t].get(word, 0) + 1
-            tier_sources[t].append(src)
-        # Allocate slots per tier
-        available = self.max_vocab_size - len(self.word2idx)
-        source_meta = []
-        for tier in sorted(tier_freq.keys()):
-            ratio = tier_ratios[tier - 1] if tier - 1 < len(tier_ratios) else 0
-            slot_count = int(available * ratio)
-            freq = tier_freq[tier]
-            print(f"  Tier {tier}: {len(freq)} unique words, allocating {slot_count} slots")
-            sorted_words = sorted(freq.items(), key=lambda x: -x[1])
-            tier_word_count = 0
-            for word, _ in sorted_words:
-                if tier_word_count >= slot_count:
-                    break
-                if word not in self.word2idx:
-                    idx = len(self.word2idx)
-                    self.word2idx[word] = idx
-                    self.idx2word[idx] = word
-                    tier_word_count += 1
-            for src in tier_sources[tier]:
-                source_meta.append({
-                    "dir": src.get("dir", ""),
-                    "file": src.get("file", ""),
-                    "tier": tier,
-                    "language": src.get("language"),
-                    "words_in_vocab": tier_word_count
-                })
-        self._sources = source_meta
-        self._tier_ratios = tier_ratios
-        self.vocab_size = len(self.word2idx)
-        capped = "(CAP REACHED)" if self.vocab_size >= self.max_vocab_size else ""
-        print(f"Vocabulary size: {self.vocab_size} (max: {self.max_vocab_size}) {capped}")
-
-    def _tokenize_text(self, text: str) -> list[str]:
-        return text.lower().split()
-
-    def tokenize_word(self, word: str) -> list[int]:
-        if word in self.word2idx:
-            return [self.word2idx[word]]
-        unk = self.word2idx["<unk>"]
-        sep = self.word2idx["<sep>"]
-        result = []
-        for i, ch in enumerate(word):
-            if i > 0:
-                result.append(sep)
-            result.append(self.word2idx.get(ch, unk))
-        return result
-
-    def encode(self, text: str) -> list[int]:
-        result = []
-        for word in self._tokenize_text(text):
-            if len(word) > self.max_word_len:
-                continue
-            result.extend(self.tokenize_word(word))
-        return result
-
-    def decode(self, indices: list[int]) -> str:
-        return " ".join(self.idx2word.get(i, "<unk>") for i in indices)
+            self._sources = meta.get("sources")
+            self._tier_ratios = meta.get("tier_ratios")
+            self.max_vocab_size = meta.get("max_vocab_size", self.max_vocab_size)
 
 
-class WordDataset(Dataset):
-    def __init__(self, texts: list[str], tokenizer: WordTokenizer, seq_length: int, cache_file=None, device=None):
-        import re, pickle
-        print(f"  Creating dataset from {len(texts)} texts...")
-        eos = tokenizer.word2idx["<eos>"]
-        unk = tokenizer.word2idx["<unk>"]
-        maxlen = tokenizer.max_word_len
-        total = len(texts)
-        strip_chars = ".,!?;:\"'()[]{},!?:"
+class BPEDataset(Dataset):
+    def __init__(self, texts: list[str], tokenizer, seq_length: int, cache_file=None, device=None):
+        eos = 2
 
-        # Cache: save/load tokenized array to avoid reprocessing
         if cache_file is None:
             cache_file = Path("data_cache.npy")
         else:
             cache_file = Path(cache_file)
         meta_file = Path(str(cache_file) + ".meta.json")
-        if cache_file.exists() and (cache_file.stat().st_size > 1_000_000_000):
+
+        if cache_file.exists() and cache_file.stat().st_size > 1_000_000_000:
             print(f"  Loading cached dataset ({cache_file.stat().st_size // 1_000_000_000}GB)...", flush=True)
             arr = np.load(str(cache_file))
             if meta_file.exists():
@@ -203,37 +214,24 @@ class WordDataset(Dataset):
                 self.token_count = len(arr)
             print(f"  Cache hit: {self.token_count:,} tokens loaded", flush=True)
         else:
-            # Estimate size and pre-allocate (2x for char-fallback expansion)
-            est = 0
-            for text in texts:
-                est += len(text.split()) + 1
-            est = int(est * 2.0)
-            arr = np.empty(est, dtype=np.int32)
-            pos = 0
-
+            print(f"  Creating dataset from {len(texts)} texts...", flush=True)
+            total = len(texts)
+            arr_list = []
             for i, text in enumerate(texts):
-                for w in text.lower().split():
-                    w = w.strip(strip_chars)
-                    if 1 <= len(w) <= maxlen:
-                        tokens = tokenizer.tokenize_word(w)
-                        for idx in tokens:
-                            arr[pos] = idx
-                            pos += 1
-                arr[pos] = eos
-                pos += 1
+                tokens = tokenizer.encode(text)
+                arr_list.extend(tokens)
+                arr_list.append(eos)
                 if (i + 1) % 2000000 == 0 or i == total - 1:
-                    print(f"    {i+1}/{total} texts, {pos//1_000_000}M tokens", flush=True)
+                    print(f"    {i+1}/{total} texts, {len(arr_list)//1_000_000}M tokens", flush=True)
 
-            arr = arr[:pos]
-            self.token_count = pos
-            print(f"  Saving cache ({pos//1_000_000}M tokens)...", flush=True)
+            arr = np.array(arr_list, dtype=np.int32)
+            self.token_count = len(arr)
+            print(f"  Saving cache ({self.token_count//1_000_000}M tokens)...", flush=True)
             np.save(str(cache_file), arr)
-            # Persist dataset meta (tokens + vocab_size used)
-            meta_file.write_text(json.dumps({"tokens": pos, "vocab_size": tokenizer.vocab_size}, separators=(",", ":")))
+            meta_file.write_text(json.dumps({"tokens": self.token_count}, separators=(",", ":")))
 
         print(f"  Keeping {self.token_count//1_000_000}M tokens on CPU (transfers per batch)...", flush=True)
-        self.data = arr  # keep as numpy array on CPU
-        del arr
+        self.data = arr
         self.seq_length = seq_length
         print(f"  Dataset ready: {len(self):,} samples (from {self.token_count:,} tokens, seq_len={self.seq_length})", flush=True)
 
@@ -246,930 +244,14 @@ class WordDataset(Dataset):
         return x, y
 
 
-BUILTIN_CORPUS = """
-In the beginning was the word, and the word was with God, and the word was God.
-He was in the beginning with God. All things were made by him; and without him
-was not any thing made that was made. In him was life; and the life was the
-light of men. And the light shineth in darkness; and the darkness comprehended
-it not. There was a man sent from God, whose name was John. The same came for
-a witness, to bear witness of the Light, that all men through him might believe.
-The Bible is a sacred book. It tells us about God and Jesus.
-The sky is blue. The grass is green. The sun is hot.
-I love learning about artificial intelligence and deep learning.
-PyTorch is a powerful library for machine learning.
-Transformers are the foundation of modern language models.
-Attention mechanisms allow models to focus on relevant parts of the input.
-Self-attention computes relationships between all positions in a sequence.
-Deep learning has revolutionized natural language processing.
-Neural networks can learn complex patterns from data.
-Training large language models requires significant computational resources.
-The future of AI is bright and full of possibilities.
-Language models generate text that is coherent and meaningful.
-They can write stories, poems, code, and essays.
-Artificial intelligence is changing the world.
-It is important to use AI responsibly and ethically.
-We must ensure that AI benefits all of humanity.
-Technology advances rapidly in the modern era.
-Innovation drives progress in society.
-Education is key to understanding new technologies.
-Curiosity fuels the desire to learn and explore.
-Knowledge is power in the digital age.
-Data is the new oil in the information economy.
-Algorithms process data to make predictions and decisions.
-Machine learning models improve over time with more data.
-Supervised learning uses labeled data for training.
-Unsupervised learning finds patterns in unlabeled data.
-Reinforcement learning learns through trial and error.
-Deep reinforcement learning combines neural networks with RL.
-AlphaGo defeated the world champion in Go.
-This was a milestone in AI history.
-Robots can now perform complex tasks in factories.
-Self-driving cars are becoming a reality.
-Medical AI helps diagnose diseases early.
-AI assistants help us manage our daily lives.
-Chatbots provide customer support around the clock.
-Virtual reality creates immersive experiences.
-Augmented reality overlays digital information on the real world.
-The metaverse is a vision of a shared virtual space.
-Blockchain technology ensures secure and transparent transactions.
-Cryptocurrencies are digital assets secured by cryptography.
-Bitcoin was the first cryptocurrency.
-Ethereum enables smart contracts on the blockchain.
-Decentralized finance aims to disrupt traditional banking.
-Non-fungible tokens represent unique digital items.
-Artificial general intelligence remains a long-term goal.
-Narrow AI excels at specific tasks.
-AI safety is a critical field of research.
-We must align AI systems with human values.
-Collaboration between humans and AI can lead to great outcomes.
-Creativity and empathy are uniquely human traits.
-AI can augment human capabilities, not replace them.
-The journey of discovery is ongoing and exciting.
-Every day brings new breakthroughs in science and technology.
-We stand on the shoulders of giants who came before us.
-Let us build a better future together with AI.
-The universe is vast and full of wonders.
-Stars are born from clouds of gas and dust.
-Gravity holds planets in orbit around stars.
-The human brain is the most complex organ.
-Science seeks to understand the natural world.
-Mathematics is the language of the universe.
-History teaches us about the past.
-Philosophy asks the big questions about existence.
-Music is a universal form of expression.
-Art reflects the human condition.
-Literature allows us to explore different perspectives.
-Science fiction imagines possible futures.
-Poetry captures emotion in condensed form.
-Dance is movement set to rhythm.
-The ocean covers most of the Earth.
-Mountains rise from the forces of the Earth.
-Forests are home to countless species.
-Rivers flow from mountains to the sea.
-Deserts are some of the harshest environments.
-Weather patterns shape our daily lives.
-Climate change is one of the greatest challenges.
-Renewable energy offers a sustainable future.
-Solar power harnesses energy from the sun.
-Wind turbines generate electricity from air currents.
-Nuclear power produces massive amounts of energy.
-Fossil fuels are the main cause of pollution.
-Recycling helps reduce waste and conserve resources.
-Conservation protects endangered species and habitats.
-The rainforest is the lungs of the planet.
-Coral reefs support marine biodiversity.
-Polar ice caps are melting at an alarming rate.
-Ocean acidification threatens marine ecosystems.
-Biodiversity is essential for ecosystem health.
-Humans are part of nature, not separate from it.
-We must protect the planet for future generations.
-Sustainable development balances economy and environment.
-Green technology is transforming industries.
-Electric vehicles reduce carbon emissions.
-Smart cities use technology to improve quality of life.
-Urban planning shapes how we live together.
-Public transportation reduces traffic congestion.
-Architecture shapes the character of a city.
-Design influences how we interact with objects.
-Engineering solves problems and builds infrastructure.
-Programming creates the digital world.
-Software powers everything from phones to rockets.
-The internet connects billions of people.
-Social media changes how we communicate.
-E-commerce has transformed shopping.
-Cloud computing stores data remotely.
-Cybersecurity protects against digital threats.
-Artificial intelligence learns from data.
-Natural language processing enables machines to understand text.
-Computer vision allows machines to see images.
-Robotics combines mechanical and intelligent systems.
-Automation increases efficiency and productivity.
-The workforce is evolving with technology.
-Remote work changes the nature of employment.
-Education adapts to new technologies.
-Online learning makes knowledge accessible.
-Critical thinking is an essential skill.
-Creativity is valued in the age of AI.
-Empathy and emotional intelligence matter more than ever.
-Leadership inspires people to achieve great things.
-Teamwork combines diverse strengths.
-Innovation requires taking risks.
-Failure is a stepping stone to success.
-Perseverance overcomes obstacles.
-Discipline builds character.
-Patience yields results.
-Humility keeps us grounded.
-Gratitude enriches our lives.
-Kindness costs nothing but means everything.
-Compassion heals wounds and builds bridges.
-Forgiveness frees the soul.
-Love is the most powerful force.
-Hope sustains us through hard times.
-Faith gives strength in adversity.
-Courage faces fear head on.
-Wisdom comes from experience and reflection.
-Truth is the foundation of trust.
-Justice ensures fairness and equality.
-Freedom requires responsibility.
-Democracy gives voice to the people.
-Law upholds order and protects rights.
-Ethics guide our decisions and actions.
-Integrity means doing the right thing.
-Honesty builds strong relationships.
-Trust is earned over time.
-Respect treats everyone with dignity.
-Generosity shares abundance with others.
-Service contributes to the common good.
-Peace is the ultimate goal of humanity.
-War brings suffering and destruction.
-Conflict resolution requires dialogue and understanding.
-Cooperation achieves what competition cannot.
-Unity in diversity makes us stronger.
-Cultural exchange enriches all societies.
-Language connects people across borders.
-Tradition preserves wisdom from the past.
-Progress builds on the foundation of history.
-Change is the only constant in life.
-Adaptation is key to survival.
-Evolution shapes the diversity of life.
-Genetics determines our inherited traits.
-Environment influences our development.
-Health is the greatest wealth.
-Exercise strengthens body and mind.
-Nutrition fuels our daily activities.
-Sleep restores energy and repairs cells.
-Mental health is as important as physical health.
-Stress management improves quality of life.
-Mindfulness brings awareness to the present moment.
-Meditation calms the restless mind.
-Yoga combines movement with breath.
-Music therapy aids emotional healing.
-Art therapy expresses inner feelings.
-Writing helps process complex emotions.
-Journaling provides clarity and self-reflection.
-Reading expands the mind and imagination.
-Travel broadens perspectives and horizons.
-Adventure fuels the spirit of exploration.
-Discovery opens new possibilities.
-Curiosity drives scientific inquiry.
-Experimentation tests hypotheses and theories.
-Observation reveals patterns in nature.
-Analysis breaks down complex problems.
-Synthesis combines ideas into new insights.
-Communication shares knowledge with others.
-Teaching multiplies understanding.
-Mentorship guides the next generation.
-Apprenticeship builds practical skills.
-Research pushes the boundaries of knowledge.
-Invention creates tools and technologies.
-Discovery reveals hidden truths.
-Innovation transforms ideas into reality.
-Collaboration accelerates progress.
-Competition drives excellence.
-Creativity brings fresh perspectives.
-Imagination envisions what could be.
-Vision charts the course for the future.
-Strategy plans the path to success.
-Execution turns plans into results.
-Leadership inspires action and change.
-Management organizes resources and people.
-Operations keep systems running smoothly.
-Finance manages money and investments.
-Marketing connects products with customers.
-Sales generates revenue and growth.
-Customer service builds loyalty and trust.
-Quality assurance maintains high standards.
-Continuous improvement drives excellence.
-Lean thinking eliminates waste and inefficiency.
-Agile methods adapt to changing requirements.
-Scrum organizes work in short cycles.
-Kanban visualizes workflow and bottlenecks.
-DevOps bridges development and operations.
-Cloud infrastructure scales with demand.
-Microservices break monoliths into components.
-APIs enable system communication.
-Databases store and retrieve information.
-Algorithms process data efficiently.
-Data structures organize information logically.
-Object-oriented programming models real-world entities.
-Functional programming emphasizes pure functions.
-Recursion solves problems by breaking them down.
-Iteration repeats steps until a condition is met.
-Abstraction hides complexity behind simple interfaces.
-Encapsulation bundles data and behavior together.
-Inheritance reuses code through class hierarchies.
-Polymorphism allows one interface for many types.
-Testing verifies that code works correctly.
-Debugging finds and fixes errors in code.
-Documentation explains how systems work.
-Version control tracks changes over time.
-Code review catches bugs and shares knowledge.
-Refactoring improves code without changing behavior.
-Optimization makes code run faster and use less memory.
-Scalability handles growing demand gracefully.
-Reliability ensures systems work under pressure.
-Security protects against threats and vulnerabilities.
-Privacy safeguards personal information.
-Accessibility makes technology available to everyone.
-Sustainability reduces environmental impact.
-Ethics guides responsible technology use.
-Governance establishes rules and accountability.
-Compliance meets legal and regulatory requirements.
-Transparency builds public trust.
-Accountability ensures responsibility for outcomes.
-Inclusivity welcomes diverse voices and perspectives.
-Equity gives everyone fair opportunities.
-Justice corrects systemic inequalities.
-Rights protect individuals from oppression.
-Liberty allows freedom of choice and expression.
-Democracy distributes power among the people.
-Republic balances freedom with structured governance.
-Constitution limits government and protects rights.
-Bill of rights enumerates fundamental freedoms.
-Separation of powers prevents concentration of authority.
-Checks and balances keep each branch accountable.
-Rule of law applies equally to all citizens.
-Due process protects against arbitrary government action.
-Habeas corpus prevents unlawful detention.
-Freedom of speech allows open discourse.
-Freedom of religion protects spiritual beliefs.
-Freedom of assembly enables peaceful protest.
-Right to privacy shields personal information.
-Right to education ensures equal opportunity.
-Right to health care maintains public well-being.
-Right to a fair trial protects the accused.
-Right to vote gives citizens political voice.
-Social contract binds citizens and government together.
-Civic duty requires participation in democracy.
-Voting is the foundation of representative government.
-Public service contributes to society.
-Volunteering helps communities thrive.
-Charity alleviates suffering and poverty.
-Philanthropy funds research and development.
-Investment builds infrastructure and creates jobs.
-Entrepreneurship drives economic innovation.
-Small businesses form the backbone of economy.
-Trade exchanges goods and services globally.
-Supply chains connect producers and consumers.
-Logistics manages the flow of goods.
-Manufacturing transforms raw materials into products.
-Agriculture feeds the world population.
-Fisheries harvest resources from the ocean.
-Forestry manages timber and wood products.
-Mining extracts minerals and metals from Earth.
-Energy production powers modern civilization.
-Transportation moves people and goods.
-Aviation connects distant parts of the world.
-Shipping carries cargo across oceans.
-Railways provide efficient land transport.
-Roads form the backbone of surface travel.
-Bridges span rivers and valleys.
-Tunnels cut through mountains and underground.
-Highways enable long-distance travel.
-Airports facilitate international travel.
-Harbors serve maritime commerce.
-Dams control water flow and generate power.
-Aqueducts transport water across distances.
-Pipelines carry oil and gas overland.
-Cables transmit data and power underwater.
-Satellites orbit Earth for communication.
-Telescopes observe distant stars and galaxies.
-Microscopes reveal the microscopic world.
-Particle accelerators explore subatomic physics.
-Computers process information at incredible speeds.
-Supercomputers simulate complex phenomena.
-Quantum computers promise exponential speedup.
-Neural networks learn from vast datasets.
-Deep learning powers image and speech recognition.
-Reinforcement learning trains agents through rewards.
-Generative models create new content.
-Large language models understand and generate text.
-Knowledge graphs organize structured information.
-Recommendation systems suggest relevant content.
-Search engines find information in milliseconds.
-Navigation systems guide drivers and pilots.
-Drones perform aerial surveillance and delivery.
-Robots automate repetitive and dangerous tasks.
-Exoskeletons augment human strength.
-Prosthetics restore lost physical functions.
-Wearables track health and fitness metrics.
-Smartphones connect us to the digital world.
-Tablets provide portable computing.
-Laptops enable mobile productivity.
-Desktops handle intensive computing tasks.
-Servers host websites and applications.
-Data centers store massive amounts of information.
-Cloud platforms deliver computing on demand.
-Edge computing processes data closer to users.
-IoT connects billions of devices worldwide.
-Smart homes automate daily living.
-Smart cities optimize urban infrastructure.
-Autonomous vehicles navigate without human input.
-Drones deliver packages to remote locations.
-3D printing creates objects layer by layer.
-Nanotechnology manipulates matter at atomic scale.
-Biotechnology modifies living organisms.
-Genetic engineering edits DNA sequences.
-Stem cell research holds promise for regenerative medicine.
-Vaccines prevent infectious diseases.
-Antibiotics treat bacterial infections.
-Immunotherapy harnesses the immune system to fight cancer.
-Radiation therapy targets cancerous cells.
-Chemotherapy kills rapidly dividing cells.
-Surgery removes diseased tissue.
-Transplantation replaces failing organs.
-Diagnostics identify diseases early.
-Imaging visualizes internal body structures.
-MRI uses magnetic fields to create detailed images.
-CT scans combine X-rays for cross-sectional views.
-Ultrasound uses sound waves for real-time imaging.
-X-rays reveal bone fractures and abnormalities.
-Blood tests measure chemical markers.
-Biopsy examines tissue samples.
-Genetic testing identifies inherited conditions.
-Screening detects diseases before symptoms appear.
-Prevention reduces risk of illness.
-Screening saves lives through early detection.
-Treatment alleviates symptoms and cures disease.
-Rehabilitation restores function after injury.
-Palliative care comforts those with serious illness.
-End-of-life care honors patient wishes.
-Grief counseling supports those who mourn.
-Support groups connect people with shared experiences.
-Therapy addresses mental health challenges.
-Counseling provides guidance during difficult times.
-Mediation resolves disputes without litigation.
-Arbitration offers alternative dispute resolution.
-Negotiation finds mutually acceptable solutions.
-Diplomacy prevents conflicts between nations.
-Treaties establish formal agreements.
-Sanctions pressure regimes to change behavior.
-Aid supports nations in crisis.
-Humanitarian relief saves lives in disasters.
-Disaster preparedness reduces casualties and damage.
-Emergency services respond to urgent situations.
-Firefighters protect communities from flames.
-Police maintain public order and safety.
-Military defends national security.
-Intelligence agencies gather strategic information.
-Cyber warfare protects digital infrastructure.
-Space exploration pushes beyond Earth.
-Mars missions search for signs of life.
-Telescopes reveal the history of the cosmos.
-Black holes bend light and time.
-Dark matter holds galaxies together.
-Dark energy accelerates cosmic expansion.
-The Big Bang created the universe.
-Planets form from disks of gas and dust.
-Asteroids are remnants of planetary formation.
-Comets carry ice from the outer solar system.
-Meteorites bring extraterrestrial material to Earth.
-Auroras light up polar skies.
-Eclipses block the sun or moon temporarily.
-Tides are driven by gravitational forces.
-Seasons result from Earth's tilted axis.
-Weather systems move across continents.
-Hurricanes form over warm ocean waters.
-Tornadoes tear through the landscape.
-Blizzards bury regions in snow.
-Droughts dry up rivers and reservoirs.
-Floods overwhelm roads and homes.
-Wildfires consume vast areas of forest.
-Earthquakes shake the ground beneath our feet.
-Volcanoes erupt with molten rock and ash.
-Tsunamis surge across coastlines.
-Landslides bury everything in their path.
-Erosion wears away mountains over millennia.
-Sedimentation builds new land from debris.
-Glaciers carve valleys and shape terrain.
-Rivers deposit fertile soil in floodplains.
-Deltas form where rivers meet the sea.
-Islands rise from volcanic activity.
-Atolls form around dying coral reefs.
-Canyons are carved by persistent water flow.
-Caves hide underground wonders.
-Geysers erupt with hot water and steam.
-Hot springs warm cold mountain valleys.
-Deserts test the limits of endurance.
-Tundras freeze under polar conditions.
-Savannas support vast herds of wildlife.
-Wetlands filter water and store carbon.
-Marshes provide habitat for birds and fish.
-Swamps teem with life and decay.
-Bogs preserve ancient organic matter.
-Peatlands store vast amounts of carbon.
-Grasslands sway in the wind.
-Woodlands shelter diverse ecosystems.
-Rainforests are the lungs of the planet.
-Cloud forests cling to mountain peaks.
-Alpine meadows bloom above the tree line.
-Desert oases sustain life in arid lands.
-Coral reefs support marine biodiversity.
-Mangroves protect coastlines from storms.
-Seagrass meadows feed marine herbivores.
-Kelp forests form underwater forests.
-Open ocean is the largest habitat on Earth.
-Deep sea trenches hold mysteries of the abyss.
-Hydrothermal vents support unique ecosystems.
-Bioluminescence lights up the dark ocean.
-Whales migrate thousands of miles each year.
-Dolphins communicate with complex clicks.
-Sharks are ancient and apex predators.
-Turtles navigate using Earth's magnetic field.
-Octopuses are masters of camouflage.
-Jellyfish drift with ocean currents.
-Plankton form the base of marine food webs.
-Fish schools move as one organism.
-Coral polyps build massive reef structures.
-Sea stars regenerate lost body parts.
-Sponges filter water with microscopic pores.
-Anemones sting with tiny venomous cells.
-Starfish cling to rocky shorelines.
-Crayfish scuttle along river bottoms.
-Crabs scavenge along sandy beaches.
-Lobsters hide in rocky crevices.
-Shrimp filter plankton from seawater.
-Mussels attach to rocks and shells.
-Clams burrow into sandy seabeds.
-Oysters build reefs that shelter other life.
-Pearls form inside oyster shells.
-Sponges produce compounds used in medicine.
-Seaweeds absorb nutrients from seawater.
-Kelp grows rapidly in cold waters.
-Algae form the base of aquatic ecosystems.
-Diatoms build glass-like microscopic shells.
-Cyanobacteria produce oxygen through photosynthesis.
-Bacteria decompose dead organic matter.
-Fungi break down tough plant material.
-Mushrooms spread spores on the wind.
-Molds grow on decaying surfaces.
-Yeasts ferment sugars into alcohol and CO2.
-Viruses infect cells and hijack machinery.
-Antibodies target and neutralize pathogens.
-T cells coordinate immune responses.
-B cells produce specific antibodies.
-Macrophages engulf and digest invaders.
-Dendritic cells present antigens to T cells.
-Natural killer cells destroy infected cells.
-Interferons inhibit viral replication.
-Cytokines signal between immune cells.
-Inflammation recruits healing cells to injury.
-Fever raises body temperature to fight infection.
-Antibiotics kill or inhibit bacterial growth.
-Vaccines train the immune system in advance.
-Immunity protects against future infections.
-Autoimmune diseases attack the body itself.
-Allergies overreact to harmless substances.
-Transplant rejection occurs when immune system fights donor tissue.
-Immunosuppressants prevent organ rejection.
-Stem cells can become any cell type.
-Tissue engineering grows replacement organs.
-Gene therapy corrects defective DNA.
-CRISPR edits genes with precision.
-Cloning creates genetic copies of organisms.
-Hybridization combines traits from different species.
-Selective breeding improves crop yields.
-Genetically modified organisms resist pests.
-Organic farming avoids synthetic chemicals.
-Permaculture designs sustainable food systems.
-Aquaponics combines fish farming with hydroponics.
-Vertical farming grows crops in stacked layers.
-Precision agriculture uses data to optimize yields.
-Drones monitor crop health from above.
-Sensors measure soil moisture and nutrients.
-Satellites track weather and climate patterns.
-Weather forecasting saves lives and property.
-Climate models predict future warming.
-Carbon capture stores CO2 underground.
-Carbon offsets fund renewable energy projects.
-Reforestation restores degraded forests.
-Afforestation plants trees where none existed.
-Conservation protects endangered species.
-Wildlife corridors connect fragmented habitats.
-National parks preserve natural landscapes.
-Marine reserves protect ocean ecosystems.
-Sustainable fishing prevents overharvesting.
-Recycling reduces waste and conserves materials.
-Composting returns nutrients to soil.
-Upcycling transforms waste into valuable products.
-Circular economy eliminates waste by design.
-Zero waste aims to send nothing to landfills.
-Minimalism reduces consumption and clutter.
-Slow living values quality over quantity.
-Simplicity brings clarity and peace.
-Nature restores the weary mind.
-Forest bathing reduces stress and anxiety.
-Gardening connects us to the seasons.
-Birdwatching reveals hidden beauty.
-Stargazing inspires wonder and awe.
-Hiking tests body and spirit.
-Climbing pushes limits of endurance.
-Swimming strengthens every muscle group.
-Running clears the mind and body.
-Cycling explores new places efficiently.
-Sailing harnesses wind for propulsion.
-Surfing rides the power of ocean waves.
-Skating glides on ice or wheels.
-Skiing descends snow-covered slopes.
-Snowboarding carves through fresh powder.
-Rock climbing tests grip and balance.
-Caving explores dark underground passages.
-Diving reveals underwater worlds.
-Snorkeling observes coral reefs up close.
-Kayaking paddles through rivers and lakes.
-Rafting races down rapids together.
-Sailing races test speed and strategy.
-Rowing builds strength and coordination.
-Windsurfing combines surfing and sailing.
-Kitesurfing harnesses wind and board.
-Paragliding soars on thermal currents.
-Skydiving freefalls through the atmosphere.
-Bungee jumping tests courage and nerves.
-White water rafting demands teamwork.
-Survival training teaches wilderness skills.
-Navigation finds direction without GPS.
-Fire making creates warmth and light.
-Shelter building protects from elements.
-Foraging identifies edible wild plants.
-Fishing provides protein from water bodies.
-Hunting tracks and harvests game animals.
-Trapping catches fur-bearing animals.
-Butchering processes meat for consumption.
-Preserving food extends shelf life.
-Canning stores food in sealed containers.
-Drying removes water to prevent spoilage.
-Smoking flavors and preserves meat and fish.
-Pickling ferments food in vinegar or brine.
-Fermentation transforms sugars into alcohol and acids.
-Baking turns dough into bread and pastries.
-Roasting concentrates flavors through dry heat.
-Grilling cooks food over open flame.
-Frying crisps food in hot oil.
-Boiling cooks food in bubbling water.
-Steaming preserves nutrients and texture.
-Searing creates a flavorful crust on meat.
-Braising tenderizes tough cuts slowly.
-Poaching cooks gently in barely simmering liquid.
-Braising combines searing and slow cooking.
-Blanching briefly cooks vegetables for freezing.
-Sauteing cooks quickly in a little fat.
-Stir frying tosses ingredients in hot wok.
-Deep frying submerges food in hot oil.
-Pan frying cooks with minimal oil.
-Griddling cooks on a flat heated surface.
-Broiling cooks with direct overhead heat.
-Microwaving heats with electromagnetic radiation.
-Slow cooking tenderizes over many hours.
-Pressure cooking speeds up cooking under pressure.
-Sous vide cooks at precise temperatures.
-Charcoal grilling imparts smoky flavor.
-Wood firing uses burning wood for heat.
-Ember roasting cooks in hot coals.
-Pit roasting buries food underground with hot stones.
-Open fire cooking is the oldest method.
-Campfire cooking brings people together.
-Backpacking meals must be light and nutritious.
-Dehydrated meals rehydrate with hot water.
-Energy bars provide quick calories on the trail.
-Trail mix combines nuts and dried fruit.
-Jerky preserves meat for long journeys.
-Hardtack is a dense biscuit that lasts forever.
-Grape leaves wrap fillings in soft parcels.
-Tortillas flatten dough into portable bread.
-Flatbreads are the oldest form of bread.
-Bagels boil then bake for chewy texture.
-Croissants layer butter and dough for flaky layers.
-Pretzels twist dough into distinctive shapes.
-Focaccia tops bread with olive oil and herbs.
-Ciabatta has a crunchy crust and airy crumb.
-Sourdough ferments with wild yeast and bacteria.
-Rye bread has a dense dark crumb.
-Whole wheat bread retains the bran and germ.
-Multigrain bread mixes several cereal grains.
-Bran bread adds high fiber bran flakes.
-Oat bread incorporates wholesome oats.
-Cornbread uses ground cornmeal for base.
-Pancakes flatten batter into golden rounds.
-Waffles iron batter into grid patterns.
-Crepes spread thin batter into delicate sheets.
-Blintzes fold crepes around sweet fillings.
-Dumplings wrap filling in dough pockets.
-Ravioli fills pasta squares with cheese or meat.
-Gyoza pan fry Japanese dumplings golden.
-Dumplings steam in bamboo baskets.
-Bao buns steam into fluffy white rounds.
-Empanadas fill pastry with savory mixtures.
-Pierogi fold dough around potato or cheese.
-Spring rolls wrap vegetables in thin wrappers.
-Egg rolls fry into crispy golden cylinders.
-Samosas triangle pastry around spiced filling.
-Pastries layer butter and dough for flaky texture.
-Tarts fill pastry shells with sweet or savory fillings.
-Pies encase filling in top and bottom crust.
-Quiche bakes eggs and cheese in pastry shell.
-Scones bake quick bread with cream and fruit.
-Biscuits rise with butter pockets and steam.
-Muffins combine quick bread and fruit or nuts.
-Cakes layer sweet batter with frosting.
-Cookies drop batter into small sweet bites.
-Brownies bake dense chocolate squares.
-Bars slice into rectangular treats.
-Brownies and blondies differ only in cocoa.
-Fudge melts chocolate and sugar into smooth candy.
-Truffles roll chocolate ganache in cocoa powder.
-Caramels cook sugar and cream to soft ball.
-Toffee bakes butter and sugar until hard crack.
-Nougat mixes egg whites sugar and nuts.
-Fondant rolls into smooth sweet paste.
-Marzipan shapes almond paste into sculptures.
-Licorice twists black anise-flavored candy.
-Gummy bears mold gelatin into bear shapes.
-Jelly beans coat hard candy with sweet shell.
-Lollipops spin sugar into colorful discs.
-Cotton candy spins sugar into fluffy strands.
-Popcorn pops kernels under heat and pressure.
-Caramel corn coats popped kernels with candy.
-Puffed rice expands grains into airy snacks.
-Chips fry potato slices into salty crisps.
-Pretzel chips bake twisted salted snacks.
-Trail mix combines nuts seeds and chocolate.
-Granola bakes oats honey and dried fruit.
-Muesli mixes raw oats with fresh fruit.
-Cereal pours milk over crunchy flakes.
-Pancakes stack golden rounds with syrup.
-Waffles grid batter into crispy pockets.
-French toast soaks bread in egg custard.
-Oatmeal simmers oats in milk or water.
-Porridge thickens grains into warm comfort food.
-Grits cook cornmeal into creamy Southern staple.
-Polenta grinds corn into Italian porridge.
-Risotto stirs Arborio rice until creamy.
-Paella cooks rice with seafood and saffron.
-Biryani layers spiced rice with meat and vegetables.
-Fried rice tosses day-old rice with eggs and veggies.
-Rice pudding simmers rice in sweetened milk.
-Arancini fry stuffed risotto into golden balls.
-Couscous steams tiny semolina pearls.
-Pasta boils dough into many shapes.
-Spaghetti twirls long thin noodles.
-Penne cuts tubes at diagonal angles.
-Fusilli spirals into twisted shapes.
-Farfalle pinches pasta into bow ties.
-Rigatoni tubes accept chunky sauces.
-Lasagna layers sheets with sauce and cheese.
-Ravioli fills square pasta with cheese or meat.
-Tortellini loops pasta into navel shapes.
-Gnocchi rolls potato dough into pillow dumplings.
-Ravioli folds filling between two pasta sheets.
-Cannelloni tubes accept creamy fillings.
-Manicotti stuffs large tubes with cheese.
-Tortelloni rolls larger filled pasta.
-Agnolotti folds thin pasta over filling.
-Pappardelle cuts wide flat ribbons.
-Linguine thins spaghetti slightly.
-Bucatini bores a hole through thick spaghetti.
-Capellini creates angel hair pasta.
-Orecchio cuts pasta into small ears.
-Conchiglie shapes pasta into seashells.
-Rotelle cuts pasta into tiny wheels.
-Stelle stamps pasta into star shapes.
-Anelli rings pasta into small circles.
-Orzo shapes pasta into rice-like grains.
-Ditalini cuts pasta into tiny tubes.
-Macaroni bends tubes into elbow shapes.
-Shell pasta scoops up chunky sauces.
-Ziti cuts straight tubes for baked pasta.
-Penne rigate adds ridges to hold sauce.
-Fettuccine cuts flat wide ribbons.
-Tagliatelle trims egg pasta into strips.
-Pappardelle widens ribbons for hearty sauces.
-Pici rolls thick hand-rolled Tuscan pasta.
-Trofie twists short thick Ligurian pasta.
-Pansotti folds tri-colored pasta into pockets.
-Maltagliata cuts miscut pasta into irregular shapes.
-Casarecce twists pasta into short spirals.
-Campanelle rings pasta into little bells.
-Gemelli twins two strands of pasta.
-Radiatori radiates pasta into ridged spirals.
-Lumache shells pasta into snail shapes.
-Conchiglie grandi creates large seashell pasta.
-Casarecce twists pasta into short cylinders.
-Gigli ties pasta into decorative bows.
-Mafalde cuts pasta into ruffled ribbons.
-Paccheri tubes accept large chunky fillings.
-Ziti bakes into cheesy layered dishes.
-Rigate adds ridges to pasta for sauce grip.
-Gnocchetti rolls small gnocchi into pillowy shapes.
-Trofie twists short thick pasta strips.
-Pansotti folds filling into triangular pockets.
-Agnolotti platti flattens filled pasta.
-Capellini al pomodoro dresses thin pasta with tomato.
-Spaghetti alle vongole clams cook with linguine.
-Penne arrabiata peppers up tomato sauce.
-Cacio e pepe peppers Pecorino and pasta.
-Carbonara creams eggs cheese and pancetta.
-Amatriciana combines guanciale with tomato sauce.
-Bolognese simmers meat sauce for hours.
-Puttanesa olives capers anchovies tomatoes.
-Marinara quick tomatoes garlic and herbs.
-Alfredo creams butter and Parmesan.
-Pesto blends basil pine nuts and cheese.
-Aglio e olio garlic and olive oil simplicity.
-Norma eggplant tomato and basil Sicilian.
-Alla gricia white carbonara without egg.
-Cacio e pepe simple pepper and cheese.
-Gricia guanciale pecorino pepper Roman.
-Tonnato tuna cream sauce Piedmontese.
-Pizzaiola pizza-style tomato sauce on pasta.
-Primavera spring vegetables with pasta.
-Puttanesa briny Mediterranean flavors.
-Arrabbiata spicy tomato kick.
-Vongole clams with white wine and garlic.
-Frutti di mare seafood medley with pasta.
-Scampi shrimp with garlic and butter.
-Linguine al nero di seppia squid ink pasta.
-Spaghetti aglio olio e peperoncino garlicky spicy.
-Pasta alla norma Sicilian eggplant classic.
-Ravioli ricotta e spinaci cheese and spinach.
-Tortellini in brodo broth floating pasta.
-Lasagna alla bolognese meat and cheese layers.
-Cannelloni spinaci e ricotta spinach filling.
-Rigatoni alla vodka creamy tomato vodka sauce.
-Penne all arrabbiata spicy tomato perfection.
-Fettuccine alfredo creamy Parmesan indulgence.
-Linguine alle vongole clamy garlic bliss.
-Gnocchi al pesto basil pine nut delight.
-Ravioli al sugo filled pasta in tomato sauce.
-Spaghetti carbonara egg cheese pancetta creaminess.
-Pappardelle al cinghiale wild boar ragout.
-Orecchiette alle cime di rapa broccoli rabe.
-Trofie al pesto Ligurian twist and basil.
-Gnocchetti sardi Sardinian small gnocchi.
-Paccheri al ragù large tubes meaty sauce.
-Mafalde al forno baked ruffled pasta.
-Gigli in brodo bow-tie pasta in broth.
-Campanelle al funghi mushroom bell pasta.
-Gemelli al pomodoro twisted pasta tomato sauce.
-Radiatori alle salsicce ridged spiral sausage.
-Lumache alla livornese snail-shaped pasta Livorno.
-Conchiglie grandi al pesto large shell pesto.
-Casarecce al ragù twisted cylinder meat sauce.
-Maltagliata in brodo miscut pasta chicken broth.
-Pappardelle al tartufi truffle wide ribbon pasta.
-Fettuccine al salmone smoked salmon cream pasta.
-Tagliatelle al prosciutto prosciutto egg pasta.
-Pici cinghiale wild boar hand-rolled Tuscan.
-Trofie al pomodoro twisted pasta tomato simple.
-Pansotti al pesto genovese folded pocket basil.
-Agnolotti del plin pinched filled Piedmont pasta.
-Capellini al limoncello lemon thin pasta light.
-Spaghetti alle cozze mussels with spaghetti.
-Penne alla norma eggplant tomato penne.
-Rigatoni alla puttanesa briny ridged tube pasta.
-Farfalle alfredo bow tie creamy cheese.
-Conchiglie al frutt di mare shell seafood pasta.
-Rotelle al pesto wheel pasta basil delight.
-Stelle al pomodoro star pasta tomato simple.
-Anelli al formaggio ring pasta cheese dip.
-Orzo al limone rice-shaped pasta lemon.
-Ditalini in zuppa tiny tube pasta soup.
-Macaroni al forno baked elbow cheese pasta.
-Shell alfredo creamy shell pasta cheese.
-Ziti alla vodka ridged tube vodka tomato.
-Penne rigate alla bolognese ridged penne meat.
-Fettuccine alla carbonara ribbon egg pancetta.
-Tagliatelle al ragù wide ribbon meat sauce.
-Pappardelle al wild mushroom wide ribbon forest.
-Linguine al scampi shrimp garlic linguine.
-Bucatini all amatriciana tube guanciale tomato.
-Capellini al pomodoro angel hair tomato basil.
-Orecchio alle cime ear pasta broccoli rabe.
-Conchiglie grandi al mare large shell seafood.
-Casarecce al ragù di agnello twisted lamb sauce.
-Gigli in bianco bow tie pasta white sauce.
-Mafalde al forno baked ruffled ribbon pasta.
-Paccheri al tonno large tube tuna sauce.
-Gemelli al pesto genovese twin basil pesto.
-Radiatori al ragù di salsicce ridged spiral sausage.
-Lumache al sugo snail pasta tomato sauce.
-Campanelle al funghi porcini bell pasta porcini.
-Stelle al limoncello star pasta lemon zest.
-Anelli al parmigiano ring pasta Parmesan butter.
-Orzo in zuppa di pesce rice-shaped seafood soup.
-Ditalini in minestrone tiny tube vegetable soup.
-Macaroni e formaggio baked elbow cheese comfort.
-Shell alfredo cream sauce shell pasta classic.
-Ziti alla marinara tube pasta quick tomato.
-Penne alla vodka e panna creamy spicy penne.
-Rigatoni al cinghiale wild boar ridged tube.
-Fettuccine al tartufo black truffle ribbon pasta.
-Tagliatelle al burro e salvia butter sage ribbon.
-Pappardelle al ragù di selvaggina game wide ribbon.
-Linguine ai frutti di mare seafood linguine classic.
-Bucatini all'amatriciana guanciale tube classic Roman.
-Capellini allo zafferano saffron angel hair delicate.
-Orecchiette al broccoli rabe ear pasta bitter sweet.
-Conchiglie grandi al ragù large shell meat sauce.
-Casarecce al pomodorino twisted cherry tomato pasta.
-Gigli al ragù di carne bow tie meat sauce.
-Mafalde alle verdure ruffled vegetable baked pasta.
-Paccheri al ragù di mare large tube seafood sauce.
-Gemelli al sugo di pomodoro twin tomato pasta.
-Radiatori al ragù di carne ridged spiral meat.
-Lumache al ragù di maiale snail pork sauce.
-Campanelle al tartufo nero truffle bell pasta.
-Stelle al pesto di basilico star basil pesto.
-Anelli al burro e parmigiano ring butter Parmesan.
-Orzo al ragù di pollo rice-shaped chicken sauce.
-Ditalini in brodo di pollo tiny tube chicken broth.
-Macaroni al ragù di carne baked elbow meat sauce.
-Shell al sugo di tonno shell tuna tomato sauce.
-Ziti alla marinara e mozzarella tube tomato cheese.
-Penne alla carbonara creamy egg penne classic.
-Rigatoni al ragù di agnello lamb ridged tube.
-Fettuccine al salmone affumicato smoked salmon ribbon.
-Tagliatelle al ragù di cinghiale wild boar ribbon.
-Pappardelle al tartufo bianco white truffle wide.
-Linguine ai gamberi rosse red shrimp linguine.
-Bucatini all'amatriciana guanciale tube Roman classic.
-Capellini al pomodorini cherry tomato angel hair.
-Orecchiette alle cime di rapa broccoli rabe classic.
-Conchiglie grandi ai frutti di mare large shell seafood.
-Casarecce al ragù di salsicce twisted sausage sauce.
-Gigli al ragù di vitello veal bow tie pasta.
-Mafalde al pesto di pistacchio pistachio ruffled.
-Paccheri al ragù di tonno large tube tuna sauce.
-Gemelli al sugo di verdure twin vegetable sauce.
-Radiatori al ragù di vitello ridged spiral veal.
-Lumache al ragù di cinghiale snail wild boar.
-Campanelle al ragù di salsicce bell sausage sauce.
-Stelle al pesto di rucola arugula star pesto.
-Anelli al ragù di maiale ring pork sauce.
-Orzo al ragù di coniglio rice-shaped rabbit sauce.
-Ditalini in zuppa di lenticchie tiny tube lentil soup.
-Macaroni al ragù di mare baked elbow seafood sauce.
-Shell al pesto di basilico shell basil pesto.
-Ziti al ragù di carne tube meat sauce baked.
-Penne alla norma eggplant tomato penne Sicilian.
-Rigatoni al ragù di agnello lamb ridged tube.
-Fettuccine al ragù di cinghiale wild boar ribbon.
-Tagliatelle al tartufo nero black truffle ribbon.
-Pappardelle al ragù di selvaggina game wide ribbon.
-Linguine ai frutti di mare mixed seafood linguine.
-Bucatini all'amatriciana guanciale tube Roman classic.
-Capellini allo zafferano saffron angel hair delicate.
-Orecchiette al broccoli rabe ear pasta classic Pugliese.
-Conchiglie grandi al ragù di mare large shell seafood.
-Casarecce al ragù di salsicce twisted sausage sauce.
-Gigli al ragù di vitello veal bow tie pasta.
-Mafalde al pesto di pistacchio pistachio ruffled.
-Paccheri al ragù di tonno large tube tuna sauce.
-Gemelli al sugo di verdure twin vegetable sauce.
-Radiatori al ragù di vitello ridged spiral veal.
-Lumache al ragù di cinghiale snail wild boar.
-Campanelle al tartufo nero truffle bell pasta.
-Stelle al pesto di rucola arugula star pesto.
-Anelli al ragù di maiale ring pork sauce.
-Orzo al ragù di coniglio rice-shaped rabbit sauce.
-Ditalini in zuppa di lenticchie tiny tube lentil soup.
-Macaroni al ragù di mare baked elbow seafood sauce.
-Shell al pesto di basilico shell basil pesto.
-Ziti al ragù di carne tube meat sauce baked.
-"""
+# Backward compatibility
+WordTokenizer = BPETokenizer
+WordDataset = BPEDataset
+
 
 def ensure_corpus(data_dir: str, extra_dirs: list = None) -> dict:
     data_path = Path(data_dir)
     data_path.mkdir(parents=True, exist_ok=True)
-    text_file = data_path / "tinystories.txt"
-
-    # Fallback: create wiki_train.txt if no corpus exists
-    if not text_file.exists():
-        print(f"Corpus not found at {text_file}")
-        print(f"Run: python init_training.py --download --force")
-        print(f"Falling back to built-in corpus.")
-        text_file = data_path / "wiki_train.txt"
-        with open(text_file, "w", encoding="utf-8") as f:
-            f.write(BUILTIN_CORPUS)
 
     # Gather all .txt from primary data_dir
     text_files = []
@@ -1192,7 +274,13 @@ def ensure_corpus(data_dir: str, extra_dirs: list = None) -> dict:
                         print(f"  Found extra corpus: {fn} ({fn.stat().st_size / (1024*1024):.0f} MB)")
 
     if not text_files:
-        text_files = [text_file]
+        raise RuntimeError(f"No .txt corpus files found in {data_dir}{', '.join(extra_dirs or []) if extra_dirs else ''}")
+
+    import re as _re
+    import html as _html
+
+    # Split on sentence boundaries: .!? followed by space+uppercase or end of line
+    _sent_split = _re.compile(r'(?<=[.!?…])\s+(?=[A-ZА-ЯАa-я\u0100-\u024F\u0400-\u04FF\u00C0-\u024F])')
 
     all_sentences = []
     sources = []
@@ -1203,15 +291,23 @@ def ensure_corpus(data_dir: str, extra_dirs: list = None) -> dict:
             meta = json.loads(meta_file.read_text())
         tier = meta.get("tier", 1)
         language = meta.get("language", None)
-        print(f"  Reading {tf} ... (tier={tier}" + (f", lang={language}" if language else "") + ")")
+        original_encoding = meta.get("original_encoding", "utf-8")
+        print(f"  Reading {tf} ... (tier={tier}" + (f", lang={language}" if language else "") + f", enc={original_encoding})")
         with open(tf, "r", encoding="utf-8") as f:
             raw = f.read()
-        sentences = [s.strip() for s in raw.split("\n") if s.strip()]
+        # Decode HTML entities
+        raw = _html.unescape(raw)
+        # Split on sentence boundaries
+        raw = ' '.join(raw.split())  # normalize whitespace
+        raw = _sent_split.split(raw)
+        sentences = [s.strip() for s in raw if s.strip() and len(s.strip()) > 2]
+        print(f"    -> {len(sentences)} sentences (from {tf.name})")
         sources.append({
             "dir": str(tf.parent),
             "file": tf.name,
             "tier": tier,
             "language": language,
+            "original_encoding": original_encoding,
             "sentences": sentences
         })
         all_sentences.extend(sentences)
@@ -1329,7 +425,7 @@ class GPTMini(nn.Module):
 # =============================================================================
 # 4. GENERATION
 # =============================================================================
-def generate_text(model: GPTMini, tokenizer: WordTokenizer, prompt: str, max_new_tokens: int = 50, temperature: float = 0.8, device: str = "cpu") -> str:
+def generate_text(model: GPTMini, tokenizer, prompt: str, max_new_tokens: int = 50, temperature: float = 0.8, device: str = "cpu") -> str:
     model.eval()
     tokens = tokenizer.encode(prompt)
     tokens = tokens[-model.wpe.size(1):]
@@ -1359,7 +455,7 @@ def get_vocab_hash(vocab_cfg: dict, data_dirs: list) -> str:
     # Tokenizer params
     h.update(json.dumps({
         "max_vocab_size": vocab_cfg.get("max_vocab_size", 32768),
-        "max_word_len": vocab_cfg.get("max_word_len", 20)
+        "model_type": "bpe"
     }, sort_keys=True, separators=(",", ":")).encode("utf-8"))
     # Data source file metadata + tier from .meta.json
     file_meta = []
@@ -1415,7 +511,7 @@ def get_model_hash(model, vocab_hash: str = None) -> str:
 #         <ckpt_dir>/<cfg_hash>/15         ← every 1000000000000000th epoch
 
 
-def _write_tier(ckpt_dir: str, cfg_hash: str, tier: int, epoch: int, loss: float, config: dict | None, model: GPTMini, extra: dict | None = None):
+def _write_tier(ckpt_dir: str, cfg_hash: str, tier: int, epoch: int, loss: float, config: dict | None, model: GPTMini, optimizer=None, extra: dict | None = None):
     if tier == 0:
         d = Path(ckpt_dir) / cfg_hash
     else:
@@ -1424,7 +520,16 @@ def _write_tier(ckpt_dir: str, cfg_hash: str, tier: int, epoch: int, loss: float
 
     sd = model.state_dict()
     sd_bf16 = {k: v.to(torch.bfloat16) if v.dtype == torch.float32 else v for k, v in sd.items()}
-    torch.save(sd_bf16, d / "model.pth")
+
+    # Tier 0 alternates between model.0.pth and model.1.pth (slot = epoch & 1)
+    if tier == 0:
+        slot = epoch & 1
+        torch.save(sd_bf16, d / f"model.{slot}.pth")
+        # Save optimizer state (only in base tier, same slot)
+        if optimizer is not None:
+            torch.save(optimizer.state_dict(), d / f"optimizer.{slot}.pt")
+    else:
+        torch.save(sd_bf16, d / "model.pth")
 
     # Resume metadata as compact JSON
     meta = {"epoch": epoch, "loss": round(loss, 6), "config_hash": cfg_hash}
@@ -1453,47 +558,25 @@ def _tiers_for_epoch(epoch: int) -> list[int]:
 
 
 # =============================================================================
-# 5b. CHECKPOINT BACKUP / RESTORE
+# 5b. CHECKPOINT SLOT CLEANUP
 # =============================================================================
-def _backup_checkpoint(ckpt_dir: Path):
-    """Before overwriting, back up model.pth → model.pth.bak (and tiers)."""
-    pth = ckpt_dir / "model.pth"
-    if pth.exists():
-        bak = ckpt_dir / "model.pth.bak"
-        import shutil
-        shutil.copy2(str(pth), str(bak))
-
-
-def _try_restore_checkpoint(ckpt_dir: Path):
-    """If model.pth is corrupt, try restoring from .bak; return True if restored."""
-    pth = ckpt_dir / "model.pth"
-    bak = ckpt_dir / "model.pth.bak"
-    if bak.exists():
-        import shutil
-        shutil.copy2(str(bak), str(pth))
-        return True
-    return False
-
-
 def _cleanup_corrupt_checkpoint(ckpt_dir: Path):
-    """Delete corrupt model.pth and any .bak."""
-    pth = ckpt_dir / "model.pth"
-    bak = ckpt_dir / "model.pth.bak"
-    if pth.exists():
-        pth.unlink()
-    if bak.exists():
-        bak.unlink()
+    """Delete all slot-based checkpoint files."""
+    for fn in ["model.0.pth", "model.1.pth", "optimizer.0.pt", "optimizer.1.pt",
+               "model.pth", "optimizer.pt"]:
+        p = ckpt_dir / fn
+        if p.exists():
+            p.unlink()
 
 
-def save_checkpoint(epoch: int, loss: float, config: dict, cfg_hash: str, model: GPTMini, ckpt_dir: str, extra: dict | None = None):
+def save_checkpoint(epoch: int, loss: float, config: dict, cfg_hash: str, model: GPTMini, ckpt_dir: str, optimizer=None, extra: dict | None = None):
     base = Path(ckpt_dir) / cfg_hash
-    _backup_checkpoint(base)
     needs_config = not (base / "config.json").exists()
-    _write_tier(ckpt_dir, cfg_hash, 0, epoch, loss, config if needs_config else None, model, extra)
+    _write_tier(ckpt_dir, cfg_hash, 0, epoch, loss, config if needs_config else None, model, optimizer, extra)
     tiers = _tiers_for_epoch(epoch)
     if tiers:
         for t in tiers:
-            _write_tier(ckpt_dir, cfg_hash, t, epoch, loss, None, model, extra)
+            _write_tier(ckpt_dir, cfg_hash, t, epoch, loss, None, model, None, extra)
         print(f"  -> Saved checkpoint at epoch {epoch} (tiers {', '.join(map(str, tiers))})")
 
 
@@ -1672,32 +755,72 @@ def train():
     start_epoch = 0
     global_batch = 0
     ckpt_state = None
+    optim_state = None
+    ckpt = None
+    resume_info = None
+
+    # Find latest checkpoint (rank 0 only, to avoid contention)
     if is_main:
         ckpt = find_latest_checkpoint(paths["checkpoint_dir"], ckpt_hash)
         if ckpt:
             ep, info, ckpt_path = ckpt
             global_batch = int(info.get("global_batch", 0))
+            resume_info = info
             print(f"Resuming from {ckpt_path} (epoch {ep}, loss {info['loss']:.6f}, global_batch {global_batch})", flush=True)
-            ckpt_state = torch.load(ckpt_path / "model.pth", map_location=DEVICE)
-            start_epoch = ep
-    else:
-        ckpt = None
 
     if dist.is_initialized():
         # Broadcast resume info from rank 0 to all ranks
         resume_data = [start_epoch, global_batch]
         dist.broadcast_object_list(resume_data, src=0)
         start_epoch, global_batch = resume_data
+        # Broadcast whether there's a checkpoint to load
+        has_ckpt = [ckpt is not None]
+        dist.broadcast_object_list(has_ckpt, src=0)
+        has_ckpt = has_ckpt[0]
+    else:
+        has_ckpt = ckpt is not None
 
-    # Load checkpointed weights
-    if ckpt_state is not None:
-        unwrapped_model.load_state_dict(ckpt_state)
+    # ALL ranks load checkpoint (DDP requires all ranks to have same weights)
+    if has_ckpt:
+        ckpt_path = Path(paths["checkpoint_dir"]) / ckpt_hash
+        # Determine slot from saved epoch (slot = epoch & 1)
+        slot = start_epoch & 1
+        model_path = ckpt_path / f"model.{slot}.pth"
+        # Fallback: try other slot, then legacy model.pth
+        if not model_path.exists():
+            model_path = ckpt_path / f"model.{1 - slot}.pth"
+        if not model_path.exists():
+            model_path = ckpt_path / "model.pth"
+        if model_path.exists():
+            ckpt_state = torch.load(str(model_path), map_location=DEVICE)
+            unwrapped_model.load_state_dict(ckpt_state)
+        # Only main rank loads optimizer state (each rank has its own optimizer)
+        if is_main:
+            optim_path = ckpt_path / f"optimizer.{slot}.pt"
+            if not optim_path.exists():
+                optim_path = ckpt_path / f"optimizer.{1 - slot}.pt"
+            if not optim_path.exists():
+                optim_path = ckpt_path / "optimizer.pt"
+            if optim_path.exists():
+                optim_state = torch.load(str(optim_path), map_location=DEVICE)
+                print(f"  Loaded optimizer state ({optim_path.stat().st_size // 1_000_000}MB)", flush=True)
 
     optimizer = torch.optim.Adam(unwrapped_model.parameters(), lr=train_cfg["lr"])
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.1)
 
-    ckpt_interval = train_cfg.get("checkpoint_interval", 0)
-    ckpt_every_min = train_cfg.get("checkpoint_every_min", 0)
+    # Restore optimizer state and advance scheduler to correct LR
+    if has_ckpt and optim_state is not None:
+        optimizer.load_state_dict(optim_state)
+        # Advance scheduler to match the epoch we're resuming from
+        for _ in range(start_epoch):
+            scheduler.step()
+        print(f"  Scheduler LR after resume: {optimizer.param_groups[0]['lr']:.6e}", flush=True)
+
+    # Checkpoint config (from 'training.checkpoint' block or legacy 'training' flat keys)
+    ckpt_cfg = train_cfg.get("checkpoint", {})
+    ckpt_every_batch = ckpt_cfg.get("every_batch", train_cfg.get("checkpoint_interval", 0))
+    ckpt_every_min = ckpt_cfg.get("every_min", train_cfg.get("checkpoint_every_min", 0))
+    ckpt_every_epoch = ckpt_cfg.get("every_epoch", train_cfg.get("checkpoint_every", 1))
     sync_cfg = train_cfg.get("sync", {})
     grad_accum = sync_cfg.get("gradient_accumulation_steps",
                   train_cfg.get("gradient_accumulation_steps", 1))
@@ -1713,8 +836,8 @@ def train():
     log_file = None
     err_file = None
     training_start_time = None
-    if ckpt and is_main:
-        training_start_time = info.get("training_start_time", None)
+    if resume_info and is_main:
+        training_start_time = resume_info.get("training_start_time", None)
     if is_main:
         ckpt_dir = Path(paths["checkpoint_dir"])
         ckpt_base = ckpt_dir / ckpt_hash
@@ -1772,7 +895,7 @@ def train():
                       f"batch {global_batch} | loss {actual_loss:.4f} | "
                       f"avg {avg:.4f} | lr {lr:.6e}", flush=True)
             should_ckpt = False
-            if ckpt_interval > 0 and global_batch % ckpt_interval == 0:
+            if ckpt_every_batch > 0 and global_batch % ckpt_every_batch == 0:
                 should_ckpt = True
             if ckpt_every_min > 0 and (time.time() - last_ckpt_time) >= ckpt_every_min * 60:
                 should_ckpt = True
@@ -1782,6 +905,7 @@ def train():
                     if is_main:
                         _write_status(log_file, epoch, global_batch, avg, training_samples, model_cfg["seq_length"], training_start_time)
                         save_checkpoint(epoch, avg, combined_config, ckpt_hash, unwrapped_model, paths["checkpoint_dir"],
+                                          optimizer=optimizer,
                                           extra={"global_batch": global_batch, "batch_size": train_cfg["batch_size"],
                                                  "seq_length": model_cfg["seq_length"], "training_samples": training_samples,
                                                  "training_start_time": training_start_time,
@@ -1801,11 +925,12 @@ def train():
         except Exception as e:
             _log_error(err_file, f"scheduler.step epoch {epoch}: {e}")
 
-        if epoch % train_cfg["checkpoint_every"] == 0:
+        if ckpt_every_epoch > 0 and epoch % ckpt_every_epoch == 0:
             try:
                 if is_main:
                     _write_status(log_file, epoch, global_batch, avg_loss, training_samples, model_cfg["seq_length"], training_start_time)
                     save_checkpoint(epoch, avg_loss, combined_config, ckpt_hash, unwrapped_model, paths["checkpoint_dir"],
+                                    optimizer=optimizer,
                                     extra={"global_batch": global_batch, "batch_size": train_cfg["batch_size"],
                                            "seq_length": model_cfg["seq_length"], "training_samples": training_samples,
                                            "training_start_time": training_start_time,
