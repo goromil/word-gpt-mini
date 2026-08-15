@@ -14,6 +14,7 @@ Usage:
 import os, sys, json, time, hashlib, signal, subprocess
 from pathlib import Path
 
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
