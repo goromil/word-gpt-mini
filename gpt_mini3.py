@@ -30,10 +30,145 @@ def config_hash(cfg):
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 # =============================================================================
-# 2. DATA: Wikipedia download + word-level tokenization
+# 2. DATA: Streaming corpus + BPE tokenization
 # =============================================================================
+
+
+def _estimate_vocab_size_streaming(file_paths, max_vocab_size):
+    """Estimate vocab size by streaming 3x 1MB samples per file. Never loads full file."""
+    unique_chars = set()
+    unique_words = set()
+    chunk_size = 1024 * 1024  # 1 MB
+
+    for fp in file_paths:
+        sz = Path(fp).stat().st_size
+        if sz == 0:
+            continue
+        with open(fp, "rb") as f:
+            # Sample front
+            f.seek(0)
+            chunk = f.read(chunk_size).decode("utf-8", errors="replace")
+            unique_chars.update(chunk)
+            unique_words.update(chunk.lower().split())
+            # Sample middle
+            if sz > chunk_size:
+                f.seek(sz // 2)
+                chunk = f.read(chunk_size).decode("utf-8", errors="replace")
+                unique_chars.update(chunk)
+                unique_words.update(chunk.lower().split())
+            # Sample end
+            if sz > chunk_size:
+                f.seek(max(0, sz - chunk_size))
+                chunk = f.read(chunk_size).decode("utf-8", errors="replace")
+                unique_chars.update(chunk)
+                unique_words.update(chunk.lower().split())
+
+    return min(max_vocab_size, len(unique_chars) + len(unique_words) + 10)
+
+
+class SentenceIterator:
+    """Lazy sentence iterator over corpus files. No full corpus in memory.
+
+    If ``sources`` is provided (list of source labels), only files whose name
+    starts with any of those labels are included.  Otherwise the full data_dir
+    is scanned.
+    """
+
+    def __init__(self, data_dir: str, extra_dirs: list = None, sources: list = None):
+        self._sources_meta = []
+        self._iterators = []
+        self._total_count = 0
+
+        data_path = Path(data_dir)
+        all_text_files = sorted(f for f in data_path.glob("*.txt")
+                                if not f.name.endswith(".meta.json"))
+
+        if extra_dirs:
+            for extra in extra_dirs:
+                extra_path = Path(extra)
+                if extra_path.exists():
+                    extra_files = sorted(f for f in extra_path.glob("*.txt")
+                                        if not f.name.endswith(".meta.json"))
+                    all_text_files.extend(f for f in extra_files if f not in all_text_files)
+
+        # Filter by source labels if provided
+        if sources:
+            text_files = []
+            for tf in all_text_files:
+                if any(tf.name.startswith(label) for label in sources):
+                    text_files.append(tf)
+        else:
+            text_files = all_text_files
+
+        for tf in text_files:
+            meta_file = Path(str(tf) + ".meta.json")
+            meta = {}
+            if meta_file.exists():
+                meta = json.loads(meta_file.read_text())
+            self._sources_meta.append({
+                "dir": str(tf.parent),
+                "file": tf.name,
+                "tier": meta.get("tier", 1),
+                "language": meta.get("language"),
+                "original_encoding": meta.get("original_encoding", "utf-8"),
+                "sentences": self._iter_file(tf),
+            })
+
+    @staticmethod
+    def _iter_file(filepath):
+        """Yield sentences from a single file, streaming."""
+        import re as _re
+        import html as _html
+        _sent_split = _re.compile(
+            r'(?<=[.!?…])\s+(?=[A-ZА-ЯАa-я\u0100-\u024F\u0400-\u04FF\u00C0-\u024F])')
+        chunk_size = 32 * 1024 * 1024
+        buffer = ""
+        with open(filepath, "r", encoding="utf-8") as f:
+            while True:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                buffer += chunk
+                buffer = _html.unescape(buffer)
+                buffer = ' '.join(buffer.split())
+                parts = _sent_split.split(buffer)
+                buffer = parts[-1]
+                for s in parts[:-1]:
+                    s = s.strip()
+                    if s and len(s) > 2:
+                        yield s
+        remaining = buffer.strip()
+        if remaining and len(remaining) > 2:
+            yield remaining
+
+    def __iter__(self):
+        for src in self._sources_meta:
+            yield from src["sentences"]
+
+    def count_sentences(self):
+        """Count total sentences (exhausts iterators, rebuilds)."""
+        import itertools
+        counts = {}
+        total = 0
+        rebuilt = []
+        for src in self._sources_meta:
+            it = src["sentences"]
+            if hasattr(it, '__iter__') and not isinstance(it, list):
+                it, it_copy = itertools.tee(it)
+                rebuilt.append({**src, "sentences": it})
+                c = sum(1 for _ in it)
+            else:
+                rebuilt.append(src)
+                c = len(it)
+            counts[src.get("tier", 1)] = counts.get(src.get("tier", 1), 0) + c
+            total += c
+        self._sources_meta = rebuilt
+        self._total_count = total
+        return total, counts
+
+
 class BPETokenizer:
-    """BPE tokenizer using SentencePiece with tier tracking."""
+    """BPE tokenizer — streaming sentences, no full corpus in memory."""
 
     def __init__(self, max_vocab_size: int = 32768, max_word_len: int = None):
         self.max_vocab_size = max_vocab_size
@@ -43,46 +178,137 @@ class BPETokenizer:
         self.word2idx = {"<pad>": 0, "<unk>": 1, "<eos>": 2}
         self.vocab_size = 3
 
-    def train(self, sources: list[dict], tier_ratios: list[float] = None):
+    @staticmethod
+    def _estimate_sent_per_mb(filepath, sample_mb=10):
+        """Read sample_mb MB, count sentences, return sentences/MB."""
+        import re as _re
+        import html as _html
+        _sent_split = _re.compile(
+            r'(?<=[.!?…])\s+(?=[A-ZА-ЯАa-я\u0100-\u024F\u0400-\u04FF\u00C0-\u024F])')
+        buf = ""
+        count = 0
+        limit = sample_mb * 1024 * 1024
+        with open(filepath, "r", encoding="utf-8") as f:
+            while limit > 0:
+                chunk = f.read(min(32 * 1024 * 1024, limit))
+                if not chunk:
+                    break
+                limit -= len(chunk)
+                buf += _html.unescape(chunk)
+                buf = ' '.join(buf.split())
+                parts = _sent_split.split(buf)
+                buf = parts[-1]
+                for p in parts[:-1]:
+                    p = p.strip()
+                    if p and len(p) > 2:
+                        count += 1
+        remaining = buf.strip()
+        if remaining and len(remaining) > 2:
+            count += 1
+        if limit >= 0:
+            mb_read = sum(1024*1024 for _ in range(sample_mb)) - limit
+            mb_read = max(mb_read, 1)
+        else:
+            mb_read = sample_mb * 1024 * 1024
+        return count / (mb_read / (1024 * 1024))
+
+    def train(self, sources, tier_ratios: list[float] = None,
+               sentence_sample_cap: int = None, pre_sample_per_source: int = 500):
+        """Train from streaming sources. Rasterized vocab sampling:
+        estimate sentences per file via file-size / avg-sent-len, then
+        spread VOCAB_SAMPLE_CAP evenly across all sources."""
         import tempfile
         import sentencepiece as spm_module
 
         tier_ratios = tier_ratios or [0.66, 0.22, 0.12]
 
-        # Group by tier for logging
-        tier_counts = {}
+        VOCAB_SAMPLE_CAP = sentence_sample_cap if sentence_sample_cap else 5_000_000
+        SAMPLE_PER_SOURCE = pre_sample_per_source
+
+        # --- Estimate sentences per source (rasterization) ---
+        first_path = None
         for src in sources:
-            t = src.get("tier", 1)
-            tier_counts[t] = tier_counts.get(t, 0) + len(src.get("sentences", []))
+            d, fn = src.get("dir", ""), src.get("file", "")
+            if d and fn:
+                first_path = str(Path(d) / fn)
+                break
+        if not first_path:
+            print("[WARN] No file paths found — falling back to sequential sampling")
+            sent_per_mb = 0
+        else:
+            sent_per_mb = self._estimate_sent_per_mb(first_path)
 
-        total = sum(tier_counts.values())
-        print(f"  Building vocab from {total} texts across {len(tier_counts)} tiers", flush=True)
-        for t in sorted(tier_counts):
-            print(f"    Tier {t}: {tier_counts[t]} sentences")
+        source_estimates = []
+        total_est = 0
+        for src in sources:
+            d, fn = src.get("dir", ""), src.get("file", "")
+            fp = Path(d) / fn if d and fn else None
+            if fp and fp.exists() and sent_per_mb > 0:
+                size_mb = fp.stat().st_size / (1024 * 1024)
+                est = int(size_mb * sent_per_mb)
+            else:
+                est = 0
+            source_estimates.append(est)
+            total_est += est
 
-        # Write all text to temp file
+        # Sampling rate: sentences to write per source
+        rates = []
+        if total_est > 0:
+            for est in source_estimates:
+                rate = int(VOCAB_SAMPLE_CAP * est / total_est)
+                rates.append(max(rate, 1))
+        else:
+            # Unknown total — equal split
+            per_src = max(VOCAB_SAMPLE_CAP // len(sources), 1)
+            rates = [per_src] * len(sources)
+
+        if total_est > 0:
+            print(f"  Rasterization: ~{total_est//1_000_000}M est. sentences, "
+                  f"{VOCAB_SAMPLE_CAP//1_000_000}M sample cap, "
+                  f"{len(sources)} files", flush=True)
+
+        # --- Single-pass: count all, write rasterized sample ---
+        tier_counts = {}
+        total = 0
+        sp_written = 0
+        sample_buffers = {i: [] for i in range(len(sources))}
+
         with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False,
-                                          encoding='utf-8') as f:
-            for src in sources:
+                                           encoding='utf-8', buffering=1024*1024) as f:
+            for si, src in enumerate(sources):
+                tier = src.get("tier", 1)
+                src_written = 0
+                src_cap = rates[si]
                 for s in src.get("sentences", []):
-                    f.write(s + '\n')
+                    total += 1
+                    tier_counts[tier] = tier_counts.get(tier, 0) + 1
+                    if src_written < src_cap:
+                        f.write(s + '\n')
+                        src_written += 1
+                        sp_written += 1
+                    buf = sample_buffers[si]
+                    if len(buf) < SAMPLE_PER_SOURCE:
+                        buf.append(s)
+                    if total % 50000000 == 0:
+                        print(f"    Counted {total:,} sentences", flush=True)
             train_file = f.name
+
+        print(f"  Corpus: {total:,} sentences across {len(tier_counts)} tiers", flush=True)
+        print(f"  Vocab training sample: {sp_written:,} sentences", flush=True)
+        for t in sorted(tier_counts):
+            print(f"    Tier {t}: {tier_counts[t]:,} sentences")
 
         model_prefix = train_file.replace('.txt', '')
 
-        # Estimate upper bound: count unique characters + whitespace-split words
-        all_text = Path(train_file).read_text(encoding='utf-8')
-        unique_chars = set(all_text)
-        unique_words = set(all_text.lower().split())
-        effective_vocab = min(self.max_vocab_size, len(unique_chars) + len(unique_words) + 10)
-        # SentencePiece needs at least 4 pieces (pad, unk, eos + 1 data piece)
+        # Streaming vocab estimate (NO read_text — avoids OOM)
+        effective_vocab = _estimate_vocab_size_streaming([train_file], self.max_vocab_size)
         effective_vocab = max(4, effective_vocab)
+        print(f"  Vocab estimate: {effective_vocab} (streaming samples)", flush=True)
 
-        # Retry with smaller vocab if SentencePiece rejects (tiny corpus constraint)
+        # Retry with smaller vocab if SentencePiece rejects
         attempt_vocab = effective_vocab
         while attempt_vocab >= 4:
             try:
-                # Suppress SentencePiece C++ logs (absl writes directly to FD 2)
                 devnull = os.open(os.devnull, os.O_WRONLY)
                 old_stderr = os.dup(2)
                 os.dup2(devnull, 2)
@@ -106,7 +332,6 @@ class BPETokenizer:
             except RuntimeError as e:
                 err = str(e)
                 if "Vocabulary size too high" in err:
-                    # Extract suggested max from error: "value <= N"
                     import re
                     m = re.search(r'<=\s*(\d+)', err)
                     if m:
@@ -125,11 +350,11 @@ class BPETokenizer:
         for i in range(3, self.sp.GetPieceSize()):
             self.word2idx[self.sp.IdToPiece(i)] = i
 
-        # Tier metadata
+        # Tier metadata from buffered samples (collected during write pass)
         source_meta = []
-        for src in sources:
+        for src, sample in zip(sources, sample_buffers.values()):
             tier = src.get("tier", 1)
-            sample = src.get("sentences", [])[:500]
+            sample = list(sample) if not isinstance(sample, list) else sample
             tokens = sum(len(self.sp.encode_as_ids(s)) for s in sample) if sample else 0
             words = sum(len(s.split()) for s in sample) if sample else 0
             source_meta.append({
@@ -195,7 +420,9 @@ class BPETokenizer:
 
 
 class BPEDataset(Dataset):
-    def __init__(self, texts: list[str], tokenizer, seq_length: int, cache_file=None, device=None):
+    def __init__(self, texts, tokenizer, seq_length: int, cache_file=None, device=None):
+        """texts: list[str] OR any iterable (streaming).
+        When building cache, uses memmap to avoid loading all tokens into memory."""
         eos = 2
 
         if cache_file is None:
@@ -214,20 +441,74 @@ class BPEDataset(Dataset):
                 self.token_count = len(arr)
             print(f"  Cache hit: {self.token_count:,} tokens loaded", flush=True)
         else:
-            print(f"  Creating dataset from {len(texts)} texts...", flush=True)
-            total = len(texts)
-            arr_list = []
-            for i, text in enumerate(texts):
-                tokens = tokenizer.encode(text)
-                arr_list.extend(tokens)
-                arr_list.append(eos)
-                if (i + 1) % 2000000 == 0 or i == total - 1:
-                    print(f"    {i+1}/{total} texts, {len(arr_list)//1_000_000}M tokens", flush=True)
+            total_label = len(texts) if isinstance(texts, (list, tuple)) else "?"
+            print(f"  Creating dataset from {total_label} texts (streaming, memmap)...", flush=True)
 
-            arr = np.array(arr_list, dtype=np.int32)
-            self.token_count = len(arr)
-            print(f"  Saving cache ({self.token_count//1_000_000}M tokens)...", flush=True)
-            np.save(str(cache_file), arr)
+            if isinstance(texts, (list, tuple)):
+                # Fast path for in-memory lists
+                arr_list = []
+                total = len(texts)
+                for i, text in enumerate(texts):
+                    tokens = tokenizer.encode(text)
+                    arr_list.extend(tokens)
+                    arr_list.append(eos)
+                    if (i + 1) % 5000000 == 0 or i == total - 1:
+                        print(f"    {i+1}/{total} texts, {len(arr_list)//1_000_000}M tokens", flush=True)
+                arr = np.array(arr_list, dtype=np.int32)
+                token_count = len(arr)
+            else:
+                # Streaming: write directly to memmap via temp file.
+                # Accumulate in 10M-token batches (36MB each), write to
+                # temp files, then merge temp files on disk (no in-memory concat).
+                batch_size = 10_000_000  # tokens per batch
+                tmp_dir = cache_file.parent / "_batches_tmp"
+                tmp_dir.mkdir(exist_ok=True)
+                batch = []
+                total_tokens = 0
+                batch_idx = 0
+
+                for i, text in enumerate(texts):
+                    tokens = tokenizer.encode(text) + [eos]
+                    batch.extend(tokens)
+                    total_tokens += len(tokens)
+                    if len(batch) >= batch_size:
+                        bpath = tmp_dir / f"b{batch_idx:05d}.npy"
+                        np.save(str(bpath), np.array(batch, dtype=np.int32))
+                        batch = []
+                        batch_idx += 1
+                    if (i + 1) % 5000000 == 0:
+                        print(f"    {i+1:,} texts, {total_tokens//1_000_000}M tokens", flush=True)
+                if batch:
+                    bpath = tmp_dir / f"b{batch_idx:05d}.npy"
+                    np.save(str(bpath), np.array(batch, dtype=np.int32))
+                    batch_idx += 1
+
+                token_count = total_tokens
+                print(f"  Total tokens: {token_count:,} ({batch_idx} batches on disk)", flush=True)
+
+                # Merge batch files on disk into final .npy via memmap
+                print(f"  Merging {batch_idx} batches into {cache_file}...", flush=True)
+                if cache_file.exists():
+                    cache_file.unlink()
+                mmap = np.lib.format.open_memmap(str(cache_file), dtype=np.int32,
+                                                  mode='w+', shape=(token_count,))
+                offset = 0
+                batch_files = sorted(tmp_dir.glob("b*.npy"))
+                for bi, bf in enumerate(batch_files):
+                    bdata = np.load(str(bf))
+                    mmap[offset:offset+len(bdata)] = bdata
+                    offset += len(bdata)
+                    del bdata
+                    if (bi + 1) % 8 == 0:
+                        print(f"    Merged {bi+1}/{batch_idx} batches, "
+                              f"{offset//1_000_000}M tokens", flush=True)
+                    bf.unlink()
+                mmap.flush()
+                del mmap
+                tmp_dir.rmdir()
+                arr = np.load(str(cache_file))
+
+            self.token_count = token_count
             meta_file.write_text(json.dumps({"tokens": self.token_count}, separators=(",", ":")))
 
         print(f"  Keeping {self.token_count//1_000_000}M tokens on CPU (transfers per batch)...", flush=True)
@@ -247,73 +528,6 @@ class BPEDataset(Dataset):
 # Backward compatibility
 WordTokenizer = BPETokenizer
 WordDataset = BPEDataset
-
-
-def ensure_corpus(data_dir: str, extra_dirs: list = None) -> dict:
-    data_path = Path(data_dir)
-    data_path.mkdir(parents=True, exist_ok=True)
-
-    # Gather all .txt from primary data_dir
-    text_files = []
-    for fn in sorted(data_path.glob("*.txt")):
-        if fn.name.endswith(".meta.json"):
-            continue
-        if fn not in text_files:
-            text_files.append(fn)
-            sz = fn.stat().st_size / (1024*1024)
-            label = "primary" if fn.name == "tinystories.txt" else "corpus"
-            print(f"  Found {label}: {fn.name} ({sz:.1f} MB)")
-
-    if extra_dirs:
-        for extra in extra_dirs:
-            extra_path = Path(extra)
-            if extra_path.exists():
-                for fn in sorted(extra_path.glob("*.txt")):
-                    if fn not in text_files:
-                        text_files.append(fn)
-                        print(f"  Found extra corpus: {fn} ({fn.stat().st_size / (1024*1024):.0f} MB)")
-
-    if not text_files:
-        raise RuntimeError(f"No .txt corpus files found in {data_dir}{', '.join(extra_dirs or []) if extra_dirs else ''}")
-
-    import re as _re
-    import html as _html
-
-    # Split on sentence boundaries: .!? followed by space+uppercase or end of line
-    _sent_split = _re.compile(r'(?<=[.!?…])\s+(?=[A-ZА-ЯАa-я\u0100-\u024F\u0400-\u04FF\u00C0-\u024F])')
-
-    all_sentences = []
-    sources = []
-    for tf in text_files:
-        meta_file = Path(str(tf) + ".meta.json")
-        meta = {}
-        if meta_file.exists():
-            meta = json.loads(meta_file.read_text())
-        tier = meta.get("tier", 1)
-        language = meta.get("language", None)
-        original_encoding = meta.get("original_encoding", "utf-8")
-        print(f"  Reading {tf} ... (tier={tier}" + (f", lang={language}" if language else "") + f", enc={original_encoding})")
-        with open(tf, "r", encoding="utf-8") as f:
-            raw = f.read()
-        # Decode HTML entities
-        raw = _html.unescape(raw)
-        # Split on sentence boundaries
-        raw = ' '.join(raw.split())  # normalize whitespace
-        raw = _sent_split.split(raw)
-        sentences = [s.strip() for s in raw if s.strip() and len(s.strip()) > 2]
-        print(f"    -> {len(sentences)} sentences (from {tf.name})")
-        sources.append({
-            "dir": str(tf.parent),
-            "file": tf.name,
-            "tier": tier,
-            "language": language,
-            "original_encoding": original_encoding,
-            "sentences": sentences
-        })
-        all_sentences.extend(sentences)
-
-    print(f"Loaded {len(all_sentences)} total sentences from {len(text_files)} files")
-    return {"sentences": all_sentences, "sources": sources}
 
 
 # =============================================================================
@@ -449,13 +663,14 @@ def generate_text(model: GPTMini, tokenizer, prompt: str, max_new_tokens: int = 
 # 5. HASHES
 # =============================================================================
 def get_vocab_hash(vocab_cfg: dict, data_dirs: list) -> str:
-    """Hash tokenizer config + data source file metadata (name, size, mtime, tier).
-    The result is the single source of truth for vocab/data cache naming."""
+    """Hash tokenizer config + data source file metadata (name, size, 16-location content samples, tier).
+    Excludes mtime for stability. Includes sentence_sample_cap in the hash."""
     h = hashlib.sha256()
     # Tokenizer params
     h.update(json.dumps({
         "max_vocab_size": vocab_cfg.get("max_vocab_size", 32768),
-        "model_type": "bpe"
+        "model_type": "bpe",
+        "sentence_sample_cap": vocab_cfg.get("sentence_sample_cap", vocab_cfg.get("vocab_sample_cap", 25000000)),
     }, sort_keys=True, separators=(",", ":")).encode("utf-8"))
     # Data source file metadata + tier from .meta.json
     file_meta = []
@@ -471,12 +686,93 @@ def get_vocab_hash(vocab_cfg: dict, data_dirs: list) -> str:
                 file_meta.append({
                     "n": fp.name,
                     "s": st.st_size,
-                    "t": st.st_mtime,
                     "tier": meta.get("tier", 1)
                 })
     file_meta.sort(key=lambda x: x["n"])
     h.update(json.dumps(file_meta, separators=(",", ":")).encode("utf-8"))
     return h.hexdigest()[:16]
+
+
+def compute_corpus_hash(data_dirs):
+    """Fast hash: relative paths + sizes + 16 evenly-spaced 1KB samples per file.
+    Excludes mtime for stability."""
+    h = hashlib.sha256()
+    base = Path(data_dirs[0]).parent
+    for d in data_dirs:
+        for root, _, files in os.walk(d):
+            for fn in sorted(files):
+                fp = Path(root) / fn
+                rel = fp.relative_to(base)
+                st = fp.stat()
+                h.update(rel.as_posix().encode())
+                h.update(str(st.st_size).encode())
+                sz = st.st_size
+                with open(fp, "rb") as f:
+                    if sz == 0:
+                        continue
+                    # Sample 16 evenly-spaced locations
+                    n = min(16, max(1, sz // 1024))
+                    for i in range(n):
+                        offset = (i * sz) // n
+                        f.seek(offset)
+                        h.update(f.read(1024))
+    return h.hexdigest()[:16]
+
+
+def ensure_cache_ready(model_cfg, vocab_cfg, paths, force=False, tokenizer_sources=None, training_sources=None):
+    """Pre-flight: ensure vocab + data cache exist before DDP spawn.
+
+    If cache is missing, builds it in the caller process (blocking).
+    Returns (vocab_cache_path, data_cache_path) tuple.
+    """
+    data_dirs = [paths["data_dir"]]
+    if "extra_data_dirs" in paths:
+        data_dirs.extend(paths["extra_data_dirs"])
+
+    cache_dir = Path(paths.get("cache_dir", "E:\\training\\cache"))
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    vocab_hash = get_vocab_hash(vocab_cfg, data_dirs)
+    corpus_h = compute_corpus_hash(data_dirs)
+
+    vocab_cache = cache_dir / f"vocab-{vocab_hash}.json"
+    data_cache = cache_dir / f"data-{vocab_hash}-{corpus_h}.npy"
+
+    vocab_ok = vocab_cache.exists() and vocab_cache.stat().st_size > 0
+    data_ok = data_cache.exists() and data_cache.stat().st_size > 1_000_000_000
+
+    if vocab_ok and data_ok and not force:
+        print(f"Cache ready (vocab={vocab_hash}, corpus={corpus_h})", flush=True)
+        return str(vocab_cache), str(data_cache)
+
+    print("[Cache build] Vocab or data cache missing — building now...", flush=True)
+    print(f"  Vocab: {vocab_cache}", flush=True)
+    print(f"  Data:  {data_cache}", flush=True)
+
+    sentence_sample_cap = vocab_cfg.get("sentence_sample_cap", vocab_cfg.get("vocab_sample_cap", 25000000))
+    pre_sample = vocab_cfg.get("pre_sample_per_source", 500)
+
+    # Build vocab (streaming — no 233M list in memory)
+    tokenizer = WordTokenizer(
+        max_vocab_size=vocab_cfg.get("max_vocab_size", 32768),
+        max_word_len=vocab_cfg.get("max_word_len", 20),
+    )
+    corpus_iter = SentenceIterator(paths["data_dir"], paths.get("extra_data_dirs"),
+                                    sources=tokenizer_sources)
+    tokenizer.train(corpus_iter._sources_meta,
+                    sentence_sample_cap=sentence_sample_cap,
+                    pre_sample_per_source=pre_sample)
+    tokenizer.save(str(vocab_cache))
+    print(f"Vocab built: {tokenizer.vocab_size} tokens -> {vocab_cache}", flush=True)
+
+    # Build dataset (streaming — second pass over corpus)
+    corpus_iter2 = SentenceIterator(paths["data_dir"], paths.get("extra_data_dirs"),
+                                    sources=training_sources)
+    dataset = WordDataset(corpus_iter2, tokenizer, model_cfg["seq_length"], cache_file=str(data_cache))
+    print(f"Dataset built: {len(dataset)} samples -> {data_cache}", flush=True)
+
+    del corpus_iter, corpus_iter2, dataset
+    return str(vocab_cache), str(data_cache)
 
 
 def get_model_hash(model, vocab_hash: str = None) -> str:
@@ -658,7 +954,7 @@ def train():
         train_cfg = full_config.get("training", {})
         paths = full_config.get("paths", {})
 
-    vocab_cfg = model_cfg.pop("vocab") if "vocab" in model_cfg else model_cfg.pop("tokenizer", {})
+    vocab_cfg = model_cfg.pop("vocab") if "vocab" in model_cfg else full_config.get("tokenizer", full_config.get("vocab", {}))
 
     DEVICE = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     is_main = (local_rank == 0)
@@ -680,52 +976,44 @@ def train():
 
     vocab_cache = cache_dir / f"vocab-{vocab_hash}.json"
 
-    # Tokenizer
-    tokenizer = WordTokenizer(max_vocab_size=vocab_cfg.get("max_vocab_size", 32768), max_word_len=vocab_cfg.get("max_word_len", 20))
-
-    # Corpus hash for data cache invalidation
-    def corpus_hash(data_dirs):
-        """Hash all files in data_dirs for data cache invalidation."""
-        h = hashlib.sha256()
-        for data_dir in data_dirs:
-            for root, _, files in os.walk(data_dir):
-                for fn in sorted(files):
-                    fp = Path(root) / fn
-                    with open(fp, "rb") as f:
-                        for chunk in iter(lambda: f.read(8192), b""):
-                            h.update(chunk)
-        return h.hexdigest()[:16]
-
-    corpus_h = corpus_hash(data_dirs)
+    corpus_h = compute_corpus_hash(data_dirs)
     data_cache = cache_dir / f"data-{vocab_hash}-{corpus_h}.npy"
 
-    sentences = []
-    corpus = None
-    if vocab_cache.exists():
+    tokenizer_sources = vocab_cfg.get("sources")
+    training_sources = train_cfg.get("sources")
+
+    sentence_sample_cap = vocab_cfg.get("sentence_sample_cap", vocab_cfg.get("vocab_sample_cap", 25000000))
+    pre_sample = vocab_cfg.get("pre_sample_per_source", 500)
+
+    tokenizer = WordTokenizer(
+        max_vocab_size=vocab_cfg.get("max_vocab_size", 32768),
+        max_word_len=vocab_cfg.get("max_word_len", 20),
+    )
+
+    vocab_ok = vocab_cache.exists() and vocab_cache.stat().st_size > 0
+    data_ok = data_cache.exists() and data_cache.stat().st_size > 1_000_000_000
+
+    if vocab_ok and data_ok:
         if is_main:
             print(f"Loading cached vocab from {vocab_cache}", flush=True)
         tokenizer.load(str(vocab_cache))
     else:
         if is_main:
-            corpus = ensure_corpus(paths["data_dir"], paths.get("extra_data_dirs", []))
-            sentences = corpus["sentences"]
-            tokenizer.build_vocab(sentences, sources=corpus["sources"])
+            corpus_iter = SentenceIterator(paths["data_dir"], paths.get("extra_data_dirs"),
+                                           sources=tokenizer_sources)
+            tokenizer.train(corpus_iter._sources_meta,
+                            sentence_sample_cap=sentence_sample_cap,
+                            pre_sample_per_source=pre_sample)
             tokenizer.save(str(vocab_cache))
             print(f"Vocab cached to {vocab_cache}", flush=True)
 
-    if data_cache.exists() and data_cache.stat().st_size > 1_000_000_000:
-        if is_main:
-            print(f"Loading cached dataset ({data_cache.stat().st_size // 1_000_000_000}GB)...", flush=True)
-        sentences = []
-    elif sentences:
-        pass  # sentences already loaded from vocab build
-    else:
-        if is_main:
-            corpus = ensure_corpus(paths["data_dir"], paths.get("extra_data_dirs", []))
-            sentences = corpus["sentences"]
-
     # Dataset
-    dataset = WordDataset(sentences, tokenizer, model_cfg["seq_length"], cache_file=str(data_cache))
+    if data_ok:
+        dataset = WordDataset([], tokenizer, model_cfg["seq_length"], cache_file=str(data_cache))
+    else:
+        corpus_iter2 = SentenceIterator(paths["data_dir"], paths.get("extra_data_dirs"),
+                                         sources=training_sources)
+        dataset = WordDataset(corpus_iter2, tokenizer, model_cfg["seq_length"], cache_file=str(data_cache))
     sampler = DistributedSampler(dataset, shuffle=True) if dist.is_initialized() else None
     dataloader = DataLoader(dataset, batch_size=train_cfg["batch_size"], sampler=sampler, drop_last=True)
     if is_main:

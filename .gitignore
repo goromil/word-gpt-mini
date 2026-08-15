@@ -39,3 +39,25 @@ errors.log
 run_hash.txt
 gpt*.json
 dataset*.json
+
+# Secrets
+.hf_token.json
+
+# Secrets
+.hf_token.json
+
+# Secrets
+.hf_token.json
+
+# Secrets
+.hf_token.json
+
+# Secrets
+.hf_token.json
+
+# Secrets
+.hf_token.json
+
+# Secrets
+.hf_token.json
+hf_token.json

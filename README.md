@@ -266,27 +266,60 @@ Or use `extra_data_dirs` for automatic discovery:
 
 ```json
 {
-  "model": { "n_layer": 16, "n_head": 6, "head_dim": 128, "seq_length": 64 },
-  "training": { "epochs": 5, "batch_size": 256, "lr": 0.0003, "checkpoint_every": 1, "checkpoint_interval": 10000, "checkpoint_every_min": 30 },
-  "tokenizer": { "max_vocab_size": 32768, "max_word_len": 20 },
-  "paths": { "data_dir": "E:\\training\\data", "extra_data_dirs": ["E:\\training\\data2"], "checkpoint_dir": "E:\\training\\checkpoints" }
+  "model": { "n_layer": 36, "n_head": 20, "head_dim": 64, "seq_length": 1024, "tokenizer": "BPE" },
+  "training": {
+    "epochs": 31,
+    "batch_size": 16,
+    "lr": 0.0002,
+    "checkpoint": { "every_batch": 250, "every_min": 30, "every_epoch": 1 },
+    "sync": { "gradient_accumulation_steps": 512, "method": "cpu", "chunks": 4 },
+    "sources": ["tinystories", "wikipedia_en_corpus", "chitanka_epub_corpus"]
+  },
+  "tokenizer": {
+    "max_vocab_size": 65536,
+    "max_word_len": 20,
+    "vocab_sample_cap": 25000000,
+    "pre_sample_per_source": 500,
+    "sources": ["tinystories", "wikipedia_en_corpus", "chitanka_epub_corpus"]
+  },
+  "paths": {
+    "data_dir": "E:\\training\\data",
+    "checkpoint_dir": "E:\\training\\checkpoints",
+    "cache_dir": "E:\\training\\cache"
+  }
 }
+```
+
+**Source filtering**: `sources` arrays filter corpus `.txt` files by name prefix.
+`tokenizer.sources` controls which corpora contribute to vocab training.
+`training.sources` controls which corpora are used for actual model training.
+Omit either array to use all available corpus files.
+
+**Sentence sampling**: `vocab_sample_cap` (default 25M) caps the number of
+sentences fed to SentencePiece. For multi-terabyte corpora, sentences are
+sampled proportionally per source using file-size-based rasterization.
+`pre_sample_per_source` (default 500) keeps a small in-memory buffer for
+estimation.
 ```
 
 ## Key Features
 
-- **Integrated Training** — model trains directly on the dataset within the script
-- **Auto Vocab Sizing** — corpus-sampled, rounded to power of 2
+- **BPE Tokenization** — SentencePiece-based tokenizer trained on sampled corpus
+- **Streaming Pipeline** — `SentenceIterator` yields sentences lazily; no full corpus in memory
+- **Source Filtering** — `tokenizer.sources` and `training.sources` config arrays select corpus subsets by filename prefix
+- **Auto Vocab Sizing** — corpus-sampled via `vocab_sample_cap`, streaming rasterization across tiers
 - **Auto Epoch Sizing** — Chinchilla scaling law calculator (N=50 default)
 - **Text Generation** — next-token prediction with temperature sampling
 - **Transformer Architecture** — multi-head attention, layer norm, feed-forward
 - **Weight Tying** — output projection tied to input embeddings
 - **CUDA Support** — automatically uses GPU if available
+- **Content-Based Caching** — deterministic hashes (no mtime) for vocab and dataset; stable across file copies
 - **Checkpointing** — batch/time/epoch triggers with global batch resume
 - **Resumable Downloads** — handles SSL interruptions, resumes from partial file
 
 ## Notes
 
-- Word-level tokenization. For production, consider BPE or WordPiece.
+- BPE tokenization via SentencePiece. Vocab is trained on a sampled subset of the corpus.
 - Adjust `n_layer`, `n_head`, `head_dim` based on hardware and dataset size.
 - Chinchilla: optimal tokens = ~200x params; 50x is practical minimum.
+- Run `python benchmark_streaming.py` on the training machine to measure pipeline throughput.

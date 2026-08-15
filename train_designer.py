@@ -238,9 +238,7 @@ def run(draft_path):
         draft = json.load(f)
 
     m = draft["model"]
-    vocab_cfg = m.get("vocab") or m.get("tokenizer", {})
-    if not isinstance(vocab_cfg, dict):
-        vocab_cfg = {"max_vocab_size": 32768, "max_word_len": 20}
+    vocab_cfg = draft.get("tokenizer", draft.get("vocab", m.get("vocab", {})))
     td = draft.get("training-defaults", {})
     paths = draft.get("paths", {})
 

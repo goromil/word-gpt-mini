@@ -7,7 +7,7 @@ with open("gpt_mini3.json", "r") as f:
     config = json.load(f)
 
 model_cfg = dict(config.get("model", {}))
-vocab_cfg = model_cfg.pop("tokenizer", model_cfg.pop("vocab", {}))
+vocab_cfg = config.get("tokenizer", config.get("vocab", {}))
 train_cfg = config.get("training", {})
 
 # Tokenizer

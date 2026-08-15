@@ -3,32 +3,41 @@
     "n_layer": 36,
     "n_head": 20,
     "head_dim": 64,
-    "seq_length": 256
+    "seq_length": 256,
+    "tokenizer": "BPE"
   },
   "training": {
     "epochs": 31,
-    "batch_size": 8,
+    "batch_size": 16,
     "lr": 0.0002,
     "checkpoint": {
-      "every_epoch": 1,
-      "every_batch": 1000,
-      "every_min": 30
+      "every_batch": 250,
+      "every_min": 30,
+      "every_epoch": 1
     },
     "sync": {
-      "gradient_accumulation_steps": 1024,
+      "gradient_accumulation_steps": 512,
       "method": "cpu",
       "chunks": 4
-    }
+    },
+    "sources": ["tinystories", "wikipedia_en_corpus", "chitanka_test_corpus", "chitanka_epub_corpus"]
   },
   "tokenizer": {
     "max_vocab_size": 32768,
-    "max_word_len": 20
+    "max_word_len": 20,
+    "vocab_sample_cap": 25000000,
+    "pre_sample_per_source": 500,
+    "special_tokens": {
+      "pad_token": "<PAD>",
+      "unk_token": "<UNK>",
+      "bos_token": "<BOS>",
+      "eos_token": "<EOS>"
+    },
+    "sources": ["tinystories", "wikipedia_en_corpus", "chitanka_epub_corpus"]
   },
   "paths": {
     "data_dir": "E:\\training\\data",
-    "extra_data_dirs": [
-      "E:\\training\\data2\\bulgarian-corpus-33b"
-    ],
+    "download_dir": "E:\\training\\dataset_dl\\downloads",
     "checkpoint_dir": "E:\\training\\checkpoints",
     "cache_dir": "E:\\training\\cache"
   }

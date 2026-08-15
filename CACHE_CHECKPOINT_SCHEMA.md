@@ -42,19 +42,17 @@ data/chitanka.txt.meta.json
 
 ### Tier Allocation
 
-When `build_vocab` runs, it allocates vocabulary slots proportionally per tier:
+When `BPETokenizer.train()` runs, it allocates BPE merges proportionally per tier:
 
-| Tier | Default Ratio | Slots (32768 vocab) |
-|------|---------------|---------------------|
-| T1   | 66%           | 21,627              |
-| T2   | 22%           | 7,209               |
-| T3   | 12%           | 3,931               |
+| Tier | Default Ratio | Description |
+|------|---------------|-------------|
+| T1   | 66%           | Primary language (English) |
+| T2   | 22%           | Secondary language |
+| T3   | 12%           | Tertiary language (Bulgarian) |
 
-Ratio configurable via `tokenizer.tier_ratios` in config.
-
-Within each tier, words are ranked by frequency. Only the top-N words per tier
-are included. This guarantees that a tier-3 Bulgarian corpus gets its allocated
-slots even though English (T1) is thousands of times larger.
+Ratio configurable via `tier_ratios` parameter. Sentence sample cap
+(`vocab_sample_cap`) controls how many sentences are fed to SentencePiece,
+keeping training fast and memory-efficient even for multi-terabyte corpora.
 
 ---
 
@@ -70,18 +68,20 @@ get_vocab_hash(vocab_cfg, data_dirs) -> str    # 16-char hex
 
 | Component | Details |
 |-----------|---------|
-| Tokenizer config | `max_vocab_size`, `max_word_len` |
-| Data file metadata | For every `*.txt` in `data_dirs`: filename, file size (`st_size`), modification time (`st_mtime`) |
+| Tokenizer config | `max_vocab_size`, `max_word_len`, `sentence_sample_cap` / `vocab_sample_cap` |
+| Data file metadata | For every `*.txt` in `data_dirs`: filename, file size (`st_size`) — **mtime excluded** |
 | **File tier** | From adjacent `.txt.meta.json` (or default `1`) |
 
 **Used for**
 
-- `vocab-{vocab_hash}.json` — cached word vocabulary
+- `vocab-{vocab_hash}.json` — cached BPE vocabulary (SentencePiece model)
 - `data-{vocab_hash}-{corpus_h}.npy` — cached tokenized data array
 
-**Why it works:**  Changing any source file (new content → new size/mtime),
-adding a file, altering tokenizer params, or changing a file's tier all produce
-a new hash.  The model architecture is intentionally excluded — the vocabulary
+**Why it works:**  Changing any source file (new content → new size),
+adding a file, altering tokenizer params, changing sentence sample cap, or
+changing a file's tier all produce a new hash.  Modification time (`mtime`) is
+intentionally excluded for stability across file copies and transfers.
+The model architecture is intentionally excluded — the vocabulary
 and tokenizer are independent of `n_layer`, `n_head`, etc.
 
 ---
@@ -89,18 +89,23 @@ and tokenizer are independent of `n_layer`, `n_head`, etc.
 ### `corpus_h`
 
 ```python
-corpus_hash(data_dirs) -> str    # 16-char hex (local function)
+compute_corpus_hash(data_dirs) -> str    # 16-char hex (shared function)
 ```
 
-**Inputs** — Full file contents of every file under `data_dirs` (hashed in 8 KB chunks).
+**Inputs** — Per file: relative path, size, plus **16 evenly-spaced 1 KB samples**
+across the file. Excludes `mtime` for stability.
+
+For files smaller than 16 KB, samples every kilobyte. For files larger than 16 KB,
+samples 1 KB at offsets spaced evenly across the file.
 
 **Used for** — Second segment of data cache: `data-{vocab_hash}-{corpus_h}.npy`.
 
 **Why separate from `vocab_hash`:**  `vocab_hash` uses lightweight file metadata
-(name, size, mtime) to detect whether the vocabulary might have changed.
-`corpus_h` hashes the full content, ensuring the `.npy` cache is invalidated
-even if file content changes without a size or mtime change (e.g., in-place
-editing that preserves size).
+(name, size, tier) to detect whether the vocabulary might have changed.
+`corpus_h` samples actual file content at multiple locations, ensuring the
+`.npy` cache is invalidated even if file content changes without a size change
+(e.g., in-place editing that preserves size). The sampling approach keeps
+computation fast while catching real content changes.
 
 ---
 
@@ -192,42 +197,39 @@ E:\training\cache\data-{vocab_hash}-{corpus_h}.meta.json
 
 ---
 
-## Tokenizer Details
+## Tokenizer Details (BPE via SentencePiece)
 
-### Reserved Tokens
+### Training Pipeline
 
-| Token | Index | Purpose |
-|-------|-------|---------|
-| `<pad>` | 0 | Padding |
-| `<unk>` | 1 | Unknown character fallback |
-| `<eos>` | 2 | End-of-sequence marker |
-| `<sep>` | 3 | Separator between split characters |
+1. `SentenceIterator` yields sentences lazily from corpus files
+2. `BPETokenizer.train()` estimates sentence counts per source, allocates a
+   proportional sample from each (total capped at `vocab_sample_cap`), and
+   writes a single sampled training file
+3. SentencePiece trains a BPE model on the sampled file with tier-aware
+   vocabulary allocation
+4. The trained model is saved as `vocab-{hash}.json`
 
-### Pre-populated Characters
+### Sentence Sampling
 
-Before tier allocation, these character tokens are always present in the vocab
-(to enable character-level fallback for words not found in the tier vocabulary):
+`vocab_sample_cap` (default: 25M sentences) limits the number of sentences
+fed to SentencePiece. For corpora larger than the cap, sentences are sampled
+proportionally per source using file-size-based rasterization. This keeps
+vocab training fast and memory-efficient.
 
-| Set | Count | Characters |
-|-----|-------|------------|
-| Latin lowercase | 26 | `a-z` |
-| Cyrillic lowercase | 33 | `абвгдежзийклмнопрстуфхцчшщъыьэюяё` |
-| Digits | 10 | `0-9` |
-| Punctuation | 2 | `'`, `-` |
-| **Total** | **71** | |
+`pre_sample_per_source` (default: 500) controls how many sentences are kept
+in memory for tier allocation estimation.
 
-### Character Fallback
+### Source Filtering
 
-When `encode()` encounters a word not in the vocabulary, it falls through to
-character-level encoding using `<sep>` between characters (no trailing `<sep>`):
+Config arrays `tokenizer.sources` and `training.sources` specify which corpus
+files to use. `SentenceIterator` filters `.txt` files by name prefix:
 
-```
-"hello" (in vocab)       →  [idx_hello]
-"неизвестен" (not found)  →  н<sep>е<sep>и<sep>з<sep>в<sep>е<sep>с<sep>т<sep>е<sep>н
+```json
+"tokenizer": { "sources": ["tinystories", "wikipedia_en_corpus", "chitanka_epub_corpus"] }
+"training": { "sources": ["tinystories", "wikipedia_en_corpus", "chitanka_test_corpus", "chitanka_epub_corpus"] }
 ```
 
-This ensures no text is lost to `<unk>` — any word in any alphabet can be
-represented as a sequence of character tokens.
+This allows different corpus subsets for vocabulary building vs. training.
 
 ---
 
@@ -335,6 +337,7 @@ via the new hash.
 | `batch_size` | everything | A DataLoader parameter, has zero effect on cached data or model weights. |
 | `lr`, `epochs`, `gradient_accumulation_steps` | `ckpt_hash` | Training hyperparameters don't change model architecture or vocabulary. Different hyperparameters should resume from the same checkpoint. |
 | `n_layer`, `n_head`, `head_dim` | `vocab_hash` | Model architecture doesn't affect tokenization. |
+| `st_mtime` | `vocab_hash`, `corpus_h` | Modification time varies across copies and transfers. File content changes are caught by size (`vocab_hash`) or content sampling (`corpus_h`). |
 
 ---
 
@@ -344,11 +347,12 @@ via the new hash.
 |----------|-----------|---------|
 | `get_vocab_hash()` | `(vocab_cfg: dict, data_dirs: list) -> str` | Yes — imported by DDP scripts |
 | `get_model_hash()` | `(model, vocab_hash: str = None) -> str` | Yes — imported by DDP scripts |
-| `ensure_corpus()` | `(data_dir, extra_dirs) -> {"sentences": [], "sources": []}` | Yes — imported by DDP scripts |
-| `corpus_hash()` | defined locally inside `train()` | No — local helper |
-| `WordTokenizer.build_vocab()` | `(texts, sources, tier_ratios)` | Yes — accepts tier-tagged sources |
-| `WordTokenizer.tokenize_word()` | `(word) -> list[int]` | Yes — word or char-fallback encoding |
-| `WordTokenizer.encode()` | `(text) -> list[int]` | Yes — full text encoding |
+| `compute_corpus_hash()` | `(data_dirs: list) -> str` | Yes — imported by DDP scripts |
+| `ensure_cache_ready()` | `(model_cfg, vocab_cfg, paths, force, tokenizer_sources, training_sources) -> tuple[str, str]` | Yes — DDP pre-flight |
+| `SentenceIterator` | `(data_dir, extra_dirs, sources) -> Iterator[str]` | Yes — lazy sentence iterator |
+| `BPETokenizer.train()` | `(sources, tier_ratios, sentence_sample_cap, pre_sample_per_source)` | Yes — streaming BPE training |
+| `BPETokenizer.encode()` | `(text) -> list[int]` | Yes — full text encoding |
+| `WordDataset` | `(sentences_or_iter, tokenizer, seq_length, cache_file)` | Yes — streaming dataset with npy cache |
 
 ---
 
@@ -357,7 +361,8 @@ via the new hash.
 1. **Single source of truth** — Each hash function is defined once in `gpt_mini3.py`. DDP scripts import it; they do not compute their own hash.
 2. **Model-first** — `ckpt_hash` reads from the instantiated model object, not from a config dict, guaranteeing the hash matches the actual tensor shapes.
 3. **Vocabulary-bound checkpoints** — `vocab_hash` is embedded in `ckpt_hash`; different vocabularies can never share or collide on checkpoints.
-4. **Metadata-first invalidation** — `vocab_hash` uses cheap file metadata (name, size, mtime, tier) to detect changes. `corpus_h` provides a full-content safety net.
+4. **Content-based invalidation** — `vocab_hash` uses cheap file metadata (name, size, tier, sample cap) without mtime. `corpus_h` samples actual content at 16 evenly-spaced locations for stability across copies while catching real changes.
 5. **No training config in names** — Hyperparameters (`lr`, `batch_size`, `epochs`, gradient accumulation) don't affect file names. Only structural attributes (tokenizer, data files, model dims) do.
-6. **Tier-guaranteed representation** — Each tier gets a proportional share of vocab slots, preventing large corpora from dominating and starving smaller-language sources.
-7. **Character fallback safety net** — No word is ever truly unknown. Words missing from the tier vocabulary decompose into character tokens, preserving signal for the model.
+6. **Streaming pipeline** — `SentenceIterator` yields sentences lazily. No full corpus is loaded into memory. `BPETokenizer.train()` consumes the iterator and writes a sampled training file for SentencePiece. `WordDataset` streams from the iterator or from cached `.npy`.
+7. **Source filtering** — `tokenizer.sources` and `training.sources` config arrays allow different corpus subsets for vocab building vs. training. `SentenceIterator` filters files by name prefix.
+8. **Mtime-free hashes** — Neither hash function includes file modification time, ensuring stable cache names across file copies, transfers, and re-downloads.

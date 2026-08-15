@@ -20,8 +20,10 @@ import torch.multiprocessing as mp
 from torch.utils.data import Sampler as DataSampler
 
 from gpt_mini3 import (
-    GPTMini, WordTokenizer, WordDataset, ensure_corpus,
+    GPTMini, WordTokenizer, WordDataset, SentenceIterator,
     save_checkpoint, find_latest_checkpoint, generate_text, get_model_hash, get_vocab_hash,
+    compute_corpus_hash,
+    ensure_cache_ready,
     _write_status, _log_error,
     _cleanup_corrupt_checkpoint,
 )
@@ -129,7 +131,7 @@ def load_config(config_path: str) -> tuple[dict, dict, dict, dict]:
     with open(config_path, "r") as f:
         cfg = json.load(f)
     model_cfg = dict(cfg.get("model", {}))
-    vocab_cfg = model_cfg.pop("tokenizer", model_cfg.pop("vocab", {}))
+    vocab_cfg = cfg.get("tokenizer", cfg.get("vocab", {}))
     train_cfg = cfg.get("training", {})
     paths = cfg.get("paths", {})
     return model_cfg, vocab_cfg, train_cfg, paths
@@ -148,19 +150,7 @@ def build_tokenizer_and_dataset(rank, world_size, model_cfg, vocab_cfg, train_cf
     cache_dir.mkdir(parents=True, exist_ok=True)
     vocab_cache = cache_dir / f"vocab-{vocab_hash}.json"
 
-    # Corpus hash for data cache
-    def _corpus_hash(directories):
-        h = hashlib.sha256()
-        for d in directories:
-            for root, _, files in os.walk(d):
-                for fn in sorted(files):
-                    fp = Path(root) / fn
-                    with open(fp, "rb") as fobj:
-                        for chunk in iter(lambda: fobj.read(8192), b""):
-                            h.update(chunk)
-        return h.hexdigest()[:16]
-
-    corpus_h = _corpus_hash(data_dirs)
+    corpus_h = compute_corpus_hash(data_dirs)
     data_cache = cache_dir / f"data-{vocab_hash}-{corpus_h}.npy"
     is_main = (rank == 0)
 
@@ -171,28 +161,42 @@ def build_tokenizer_and_dataset(rank, world_size, model_cfg, vocab_cfg, train_cf
 
     sentences = []
     corpus = None
-    if vocab_cache.exists() and data_cache.exists() and data_cache.stat().st_size > 1_000_000_000:
+    vocab_ok = vocab_cache.exists() and vocab_cache.stat().st_size > 0
+    data_ok = data_cache.exists() and data_cache.stat().st_size > 1_000_000_000
+
+    if vocab_ok and data_ok:
         if is_main:
             print("Loading cached vocab + dataset...", flush=True)
         tokenizer.load(vocab_cache)
     else:
+        # Should not happen — pre-flight ensure_cache_ready should have built it
+        missing = []
+        if not vocab_ok:
+            missing.append(f"vocab: {vocab_cache}")
+        if not data_ok:
+            missing.append(f"data: {data_cache}")
         if is_main:
-            corpus = ensure_corpus(paths["data_dir"], paths.get("extra_data_dirs", []))
-            tokenizer.build_vocab(corpus["sentences"], sources=corpus["sources"])
+            print(f"[WARN] Cache incomplete: {', '.join(missing)}", flush=True)
+            print(f"  Building vocab on rank 0 (others will wait)...", flush=True)
+            corpus_iter = SentenceIterator(paths["data_dir"], paths.get("extra_data_dirs", []))
+            tokenizer.train(corpus_iter._sources_meta)
             tokenizer.save(vocab_cache)
             print(f"Vocab built: {tokenizer.vocab_size} tokens, cached to {vocab_cache}", flush=True)
         dist.barrier()
         if not is_main:
             tokenizer.load(vocab_cache)
-    if corpus:
-        sentences = corpus["sentences"]
+    sentences = None
 
-    # Build / load dataset
+    # Build / load dataset (streaming fallback for incomplete cache)
     if is_main:
-        dataset = WordDataset(sentences, tokenizer, model_cfg["seq_length"],
-                              cache_file=str(data_cache))
+        if vocab_ok and data_ok:
+            dataset = WordDataset([], tokenizer, model_cfg["seq_length"],
+                                  cache_file=str(data_cache))
+        else:
+            corpus_iter2 = SentenceIterator(paths["data_dir"], paths.get("extra_data_dirs", []))
+            dataset = WordDataset(corpus_iter2, tokenizer, model_cfg["seq_length"],
+                                  cache_file=str(data_cache))
         print(f"Dataset: {len(dataset)} samples", flush=True)
-        del sentences
     else:
         dataset = WordDataset([], tokenizer, model_cfg["seq_length"],
                               cache_file=str(data_cache))
@@ -720,6 +724,17 @@ def run():
         devices = tuple(range(cuda_count))
 
     world_size = len(devices)
+
+    # Pre-flight: ensure vocab + data cache exist before spawning DDP
+    with open(args.config, "r") as f:
+        cfg = json.load(f)
+    _model_cfg = dict(cfg.get("model", {}))
+    _vocab_cfg = cfg.get("tokenizer", cfg.get("vocab", {}))
+    _paths = cfg.get("paths", {})
+    _train_cfg = cfg.get("training", {})
+    ensure_cache_ready(_model_cfg, _vocab_cfg, _paths,
+                        tokenizer_sources=_vocab_cfg.get("sources"),
+                        training_sources=_train_cfg.get("sources"))
 
     # Setup PID tracking for children
     pid_file = _get_pid_file()

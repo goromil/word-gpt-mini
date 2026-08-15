@@ -700,55 +700,6 @@ def test_checkpoint_resume_weights():
 
 
 # =============================================================================
-# 10. CORPUS TESTS
-# =============================================================================
-def test_ensure_corpus_existing():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        text_file = Path(tmpdir) / "tinystories.txt"
-        text_file.write_text("hello world.\nfoo bar.\n", encoding="utf-8")
-        result = gpt_mini3.ensure_corpus(tmpdir)
-        sentences = result["sentences"]
-        assert len(sentences) == 2
-        assert sentences[0] == "hello world."
-        assert len(result["sources"]) == 1
-    print("PASS: ensure_corpus_existing")
-
-
-def test_ensure_corpus_creates_dir():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        new_dir = Path(tmpdir) / "subdir"
-        new_dir.mkdir(parents=True, exist_ok=True)
-        (new_dir / "corpus.txt").write_text("The cat sat on the mat. The dog ran fast. ", encoding="utf-8")
-        result = gpt_mini3.ensure_corpus(str(new_dir))
-        sentences = result["sentences"]
-        assert len(sentences) > 0
-        assert new_dir.exists()
-    print("PASS: ensure_corpus_creates_dir")
-
-
-def test_ensure_corpus_empty_dir_error():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        new_dir = Path(tmpdir) / "empty"
-        new_dir.mkdir()
-        try:
-            gpt_mini3.ensure_corpus(str(new_dir))
-            assert False, "Should have raised RuntimeError"
-        except RuntimeError as e:
-            assert "No .txt corpus files found" in str(e)
-    print("PASS: ensure_corpus_empty_dir_error")
-
-
-def test_ensure_corpus_empty_file():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        text_file = Path(tmpdir) / "tinystories.txt"
-        text_file.write_text("\n\n\n", encoding="utf-8")
-        result = gpt_mini3.ensure_corpus(tmpdir)
-        sentences = result["sentences"]
-        assert len(sentences) == 0
-    print("PASS: ensure_corpus_empty_file")
-
-
-# =============================================================================
 # 11. EDGE CASES
 # =============================================================================
 def test_attention_seq_length_exceeded():
@@ -914,9 +865,6 @@ if __name__ == "__main__":
         test_find_latest_checkpoint_tier_newer,
         test_find_latest_checkpoint_wrong_hash,
         test_checkpoint_resume_weights,
-        test_ensure_corpus_existing,
-        test_ensure_corpus_creates_dir,
-        test_ensure_corpus_empty_file,
         test_attention_seq_length_exceeded,
         test_gpt_mini_max_seq_length,
         test_gpt_mini_min_seq_length,

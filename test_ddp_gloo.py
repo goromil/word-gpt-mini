@@ -32,7 +32,7 @@ def test_ddp(rank, world_size):
         with open("gpt_mini3.json") as f:
             cfg = json.load(f)
         model_cfg = dict(cfg["model"])
-        vocab_cfg = model_cfg.pop("tokenizer", {})
+        vocab_cfg = cfg.get("tokenizer", cfg.get("vocab", {}))
 
         tok = WordTokenizer()
         tok.load(f"E:\\training\\cache\\vocab-b216b5d27286a3c1.json")
