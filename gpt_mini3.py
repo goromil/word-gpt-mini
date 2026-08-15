@@ -433,7 +433,7 @@ class BPEDataset(Dataset):
 
         if cache_file.exists() and cache_file.stat().st_size > 1_000_000_000:
             print(f"  Loading cached dataset ({cache_file.stat().st_size // 1_000_000_000}GB)...", flush=True)
-            arr = np.load(str(cache_file))
+            arr = np.load(str(cache_file), mmap_mode='r')
             if meta_file.exists():
                 meta = json.loads(meta_file.read_text())
                 self.token_count = meta["tokens"]
@@ -506,7 +506,7 @@ class BPEDataset(Dataset):
                 mmap.flush()
                 del mmap
                 tmp_dir.rmdir()
-                arr = np.load(str(cache_file))
+                arr = np.load(str(cache_file), mmap_mode='r')
 
             self.token_count = token_count
             meta_file.write_text(json.dumps({"tokens": self.token_count}, separators=(",", ":")))
