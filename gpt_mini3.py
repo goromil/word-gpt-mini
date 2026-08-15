@@ -931,6 +931,13 @@ def read_current_checkpoint(ckpt_dir: str) -> dict | None:
         return None
 
 
+def _update_config_checkpoint(config_path: str, full_config: dict, ckpt_hash: str, epoch: int, loss: float):
+    """Update checkpoint pointer in config file."""
+    full_config["checkpoint"] = {"ckpt_hash": ckpt_hash, "epoch": epoch, "loss": round(loss, 6)}
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(full_config, f, indent=2)
+
+
 # =============================================================================
 # 6. CHECKPOINTING
 # =============================================================================
@@ -1300,29 +1307,65 @@ def train():
     vocab_conf_h = get_vocab_conf_hash(vocab_cfg, tokenizer_sources)
     corpus_conf_h = get_corpus_conf_hash(training_sources)
 
-    # Step 2: try config-only cache lookup (fast, no data dir scanning)
-    hit = _try_conf_cache(cache_dir, vocab_conf_h, corpus_conf_h)
-    if hit:
-        vocab_cache, data_cache = Path(hit[0]), Path(hit[1])
-        if is_main:
-            print(f"Cache ready (vocab conf={vocab_conf_h}, corpus conf={corpus_conf_h})", flush=True)
-
-    # Step 3: content hashes (scan data dirs, file I/O)
-    if not vocab_cache:
+    # Step 2: try content hashes (may fail if data dirs missing → path 2)
+    data_available = True
+    try:
         vocab_hash = get_vocab_hash(vocab_cfg, data_dirs)
         if is_main:
             print(f"Vocab hash: {vocab_hash}")
         corpus_h = compute_corpus_hash(data_dirs)
-        hit = _try_conf_cache(cache_dir, vocab_conf_h, corpus_conf_h, vocab_hash, corpus_h)
+    except Exception as e:
+        if is_main:
+            print(f"[WARN] Cannot compute content hashes: {e}", flush=True)
+            print("  Falling back to checkpoint pointer in config (path 2)...", flush=True)
+        data_available = False
+
+    if data_available:
+        # --- PATH 1: data present ---
+        # Step 3: try config-only cache lookup (fast, no data dir scanning)
+        hit = _try_conf_cache(cache_dir, vocab_conf_h, corpus_conf_h)
         if hit:
             vocab_cache, data_cache = Path(hit[0]), Path(hit[1])
             if is_main:
-                print(f"Cache ready (vocab={vocab_hash}, corpus={corpus_h})", flush=True)
+                print(f"Cache ready (vocab conf={vocab_conf_h}, corpus conf={corpus_conf_h})", flush=True)
 
-    # Step 4: fallback — will build cache
-    if not vocab_cache:
-        vocab_cache = cache_dir / f"vocab-{vocab_conf_h}-{vocab_hash}.json"
-        data_cache = cache_dir / f"data-{corpus_conf_h}-{vocab_hash}-{corpus_h}.npy"
+        # Step 4: try full hash match
+        if not vocab_cache:
+            hit = _try_conf_cache(cache_dir, vocab_conf_h, corpus_conf_h, vocab_hash, corpus_h)
+            if hit:
+                vocab_cache, data_cache = Path(hit[0]), Path(hit[1])
+                if is_main:
+                    print(f"Cache ready (vocab={vocab_hash}, corpus={corpus_h})", flush=True)
+
+        # Step 5: fallback — will build cache
+        if not vocab_cache:
+            vocab_cache = cache_dir / f"vocab-{vocab_conf_h}-{vocab_hash}.json"
+            data_cache = cache_dir / f"data-{corpus_conf_h}-{vocab_hash}-{corpus_h}.npy"
+    else:
+        # --- PATH 2: data missing, read from config checkpoint pointer ---
+        ckpt_cfg = full_config.get("checkpoint")
+        if not ckpt_cfg or not ckpt_cfg.get("ckpt_hash"):
+            print("[ERROR] Data files missing and no checkpoint pointer in config. "
+                  "Cannot resume.", flush=True)
+            sys.exit(1)
+        ckpt_hash = ckpt_cfg["ckpt_hash"]
+        if is_main:
+            print(f"Path 2: checkpoint hash from config: {ckpt_hash}", flush=True)
+        # Read cache_lock from checkpoint dir
+        ckpt_base_dir = Path(paths["checkpoint_dir"]) / ckpt_hash
+        lock = read_cache_lock(str(ckpt_base_dir))
+        if not lock:
+            print(f"[ERROR] cache_lock.json missing in {ckpt_base_dir}. "
+                  f"Cannot locate cache files.", flush=True)
+            sys.exit(1)
+        vocab_cache = cache_dir / lock["vocab_cache"]
+        data_cache = cache_dir / lock["data_cache"]
+        if not vocab_cache.exists() or not data_cache.exists():
+            print(f"[ERROR] Cache files missing:\n  {vocab_cache}\n  {data_cache}", flush=True)
+            sys.exit(1)
+        if is_main:
+            print(f"Cache ready from lock: {vocab_cache.name}, {data_cache.name}", flush=True)
+        vocab_hash = None  # not computable
 
     sentence_sample_cap = vocab_cfg.get("sentence_sample_cap", vocab_cfg.get("vocab_sample_cap", 25000000))
     pre_sample = vocab_cfg.get("pre_sample_per_source", 500)
@@ -1388,6 +1431,19 @@ def train():
     optim_state = None
     ckpt = None
     resume_info = None
+
+    # Write cache_lock.json at training start (rank 0)
+    # Also write checkpoint pointer into config file (only for default config)
+    is_default_config = (os.path.basename(config_path) == "gpt_mini3.json")
+    if is_main:
+        ckpt_base_dir = Path(paths["checkpoint_dir"]) / ckpt_hash
+        ckpt_base_dir.mkdir(parents=True, exist_ok=True)
+        write_cache_lock(str(ckpt_base_dir), vocab_cache.name, data_cache.name)
+        if is_default_config:
+            # Write checkpoint pointer into config file
+            full_config["checkpoint"] = {"ckpt_hash": ckpt_hash, "epoch": 0, "loss": 0.0}
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(full_config, f, indent=2)
 
     # Find latest checkpoint (rank 0 only, to avoid contention)
     if is_main:
@@ -1544,8 +1600,10 @@ def train():
                                                    "vocab_size": tokenizer.vocab_size,
                                                    "dataset_tokens": dataset.token_count,
                                                    "dataset_samples": len(dataset)},
-                                            vocab_cache_name=vocab_cache.name,
-                                            data_cache_name=data_cache.name)
+                                             vocab_cache_name=vocab_cache.name,
+                                             data_cache_name=data_cache.name)
+                        if is_default_config:
+                            _update_config_checkpoint(config_path, full_config, ckpt_hash, epoch, avg)
                     if dist.is_initialized():
                         dist.barrier()
                 except Exception as e:
@@ -1575,6 +1633,8 @@ def train():
                                             "dataset_samples": len(dataset)},
                                     vocab_cache_name=vocab_cache.name,
                                     data_cache_name=data_cache.name)
+                    if is_default_config:
+                        _update_config_checkpoint(config_path, full_config, ckpt_hash, epoch, avg_loss)
                 if dist.is_initialized():
                     dist.barrier()
             except Exception as e:
