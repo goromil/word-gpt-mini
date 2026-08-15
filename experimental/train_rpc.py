@@ -31,7 +31,8 @@ from torch.utils.data import DataLoader, Subset
 from gpt_mini3 import (
     GPTMini, WordTokenizer, WordDataset, SentenceIterator,
     save_checkpoint, find_latest_checkpoint,
-    compute_corpus_hash,
+    compute_corpus_hash, get_vocab_hash,
+    get_vocab_conf_hash, get_corpus_conf_hash, _try_conf_cache,
     _write_status, _log_error,
 )
 
@@ -233,27 +234,42 @@ def load_config(config_path):
     return model_cfg, vocab_cfg, train_cfg, paths
 
 
-def build_tokenizer_and_dataset(rank, world_size, model_cfg, vocab_cfg, paths, barrier):
-    model_param_dict = {
-        "n_layer": model_cfg["n_layer"], "n_head": model_cfg["n_head"],
-        "head_dim": model_cfg["head_dim"], "seq_length": model_cfg["seq_length"],
-        "max_vocab_size": vocab_cfg.get("max_vocab_size", 32768),
-        "max_word_len": vocab_cfg.get("max_word_len", 20),
-    }
-    model_param_hash = hashlib.sha256(
-        json.dumps(model_param_dict, sort_keys=True).encode()
-    ).hexdigest()[:16]
-
+def build_tokenizer_and_dataset(rank, world_size, model_cfg, vocab_cfg, paths, barrier, force=False):
     cache_dir = Path(paths.get("cache_dir", "E:\\training\\cache"))
     cache_dir.mkdir(parents=True, exist_ok=True)
-    vocab_cache = cache_dir / f"vocab-{model_param_hash}.json"
 
     data_dirs = [paths["data_dir"]]
     if "extra_data_dirs" in paths:
         data_dirs.extend(paths["extra_data_dirs"])
 
-    corpus_h = compute_corpus_hash(data_dirs)
-    data_cache = cache_dir / f"data-{model_param_hash}-{corpus_h}.npy"
+    tokenizer_sources = vocab_cfg.get("sources")
+    training_sources = vocab_cfg.get("sources")  # RPC doesn't distinguish
+
+    # Step 1: config-only hashes (no file I/O)
+    vocab_conf_h = get_vocab_conf_hash(vocab_cfg, tokenizer_sources)
+    corpus_conf_h = get_corpus_conf_hash(training_sources)
+
+    # Step 2: try config-only cache lookup
+    vocab_cache = None
+    data_cache = None
+    if not force:
+        hit = _try_conf_cache(cache_dir, vocab_conf_h, corpus_conf_h)
+        if hit:
+            vocab_cache, data_cache = Path(hit[0]), Path(hit[1])
+
+    # Step 3: content hashes
+    if not vocab_cache:
+        vocab_hash = get_vocab_hash(vocab_cfg, data_dirs)
+        corpus_h = compute_corpus_hash(data_dirs)
+        hit = _try_conf_cache(cache_dir, vocab_conf_h, corpus_conf_h, vocab_hash, corpus_h)
+        if hit:
+            vocab_cache, data_cache = Path(hit[0]), Path(hit[1])
+
+    # Step 4: fallback paths for build
+    if not vocab_cache:
+        vocab_cache = cache_dir / f"vocab-{vocab_conf_h}-{vocab_hash}.json"
+        data_cache = cache_dir / f"data-{corpus_conf_h}-{vocab_hash}-{corpus_h}.npy"
+
     is_main = (rank == 0)
 
     tokenizer = WordTokenizer(
@@ -507,6 +523,8 @@ def run():
     parser.add_argument("--epochs", type=int, default=0)
     parser.add_argument("--save_every", type=int, default=0)
     parser.add_argument("config", nargs="?", default="gpt_mini3.json")
+    parser.add_argument("--cache-renew", action="store_true",
+                        help="Force rebuild vocab + data cache")
     args = parser.parse_args()
 
     if args.rank < 0 or args.rank >= args.world_size:
@@ -536,7 +554,8 @@ def run():
 
     # Tokenizer + dataset
     tokenizer, dataset = build_tokenizer_and_dataset(
-        args.rank, args.world_size, model_cfg, vocab_cfg, paths, barrier
+        args.rank, args.world_size, model_cfg, vocab_cfg, paths, barrier,
+        force=args.cache_renew
     )
 
     # Checkpoint hash = model params only (matches gpt_mini3.py's cfg_hash)

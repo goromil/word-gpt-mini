@@ -160,6 +160,44 @@ def bench_corpus_hash():
     }
 
 
+def bench_conf_hashes():
+    """Measure config-only hash computation speed (no file I/O)."""
+    config = load_config()
+    vocab_cfg = get_vocab_cfg(config)
+    tokenizer_sources = vocab_cfg.get("sources")
+    training_sources = config.get("training", {}).get("sources")
+
+    # Warm-up
+    vc_h = gpt_mini3.get_vocab_conf_hash(vocab_cfg, tokenizer_sources)
+    cp_h = gpt_mini3.get_corpus_conf_hash(training_sources)
+    print(f"  vocab_conf_hash: {vc_h}")
+    print(f"  corpus_conf_hash: {cp_h}")
+
+    # Timed runs
+    N = 100
+    vc_times = []
+    cp_times = []
+    for _ in range(N):
+        t0 = time.perf_counter()
+        gpt_mini3.get_vocab_conf_hash(vocab_cfg, tokenizer_sources)
+        vc_times.append(time.perf_counter() - t0)
+
+        t0 = time.perf_counter()
+        gpt_mini3.get_corpus_conf_hash(training_sources)
+        cp_times.append(time.perf_counter() - t0)
+
+    vc_avg = sum(vc_times) / len(vc_times) * 1000
+    cp_avg = sum(cp_times) / len(cp_times) * 1000
+    print(f"  {N} runs: vocab_conf avg {vc_avg:.3f}ms, corpus_conf avg {cp_avg:.3f}ms")
+    return {
+        "vocab_conf_hash": vc_h,
+        "corpus_conf_hash": cp_h,
+        "vocab_conf_avg_ms": round(vc_avg, 3),
+        "corpus_conf_avg_ms": round(cp_avg, 3),
+        "runs": N,
+    }
+
+
 # ---------------------------------------------------------------------------
 # 2. SentenceIterator benchmarks
 # ---------------------------------------------------------------------------
@@ -423,6 +461,7 @@ def main():
         "hash": [
             lambda: run_bench("vocab_hash", bench_vocab_hash),
             lambda: run_bench("corpus_hash", bench_corpus_hash),
+            lambda: run_bench("conf_hashes", bench_conf_hashes),
         ],
         "iterator": [
             lambda: run_bench("iterator_count", bench_iterator_count),

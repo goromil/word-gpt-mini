@@ -719,11 +719,75 @@ def compute_corpus_hash(data_dirs):
     return h.hexdigest()[:16]
 
 
+def get_vocab_conf_hash(vocab_cfg: dict, sources: list[str] | None) -> str:
+    """Config-only hash for vocab: max_vocab_size, sentence_sample_cap, source names.
+    No file I/O — detects config-side parameter changes instantly."""
+    h = hashlib.sha256()
+    h.update(json.dumps({
+        "max_vocab_size": vocab_cfg.get("max_vocab_size", 32768),
+        "sentence_sample_cap": vocab_cfg.get("sentence_sample_cap", vocab_cfg.get("vocab_sample_cap", 25000000)),
+    }, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+    if sources:
+        h.update(json.dumps(sorted(sources), separators=(",", ":")).encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
+def get_corpus_conf_hash(sources: list[str] | None) -> str:
+    """Config-only hash for corpus: source names only.
+    No file I/O — detects config-side source changes instantly."""
+    h = hashlib.sha256()
+    if sources:
+        h.update(json.dumps(sorted(sources), separators=(",", ":")).encode("utf-8"))
+    else:
+        h.update(b"")
+    return h.hexdigest()[:16]
+
+
+def _try_conf_cache(cache_dir, vocab_conf_h, corpus_conf_h, vocab_hash=None, corpus_hash=None):
+    """Config-only cache pre-check. Glob cache_dir for files matching conf hashes.
+    If both vocab and data found with correct sizes, returns (vocab_path, data_path).
+    Optionally validates that content hashes match too (when provided).
+    Returns None if cache not found or stale."""
+    # Try exact match (all 4 hash parts known)
+    if vocab_hash and corpus_hash:
+        vc = cache_dir / f"vocab-{vocab_conf_h}-{vocab_hash}.json"
+        dc = cache_dir / f"data-{corpus_conf_h}-{vocab_hash}-{corpus_hash}.npy"
+        if vc.exists() and vc.stat().st_size > 0 and dc.exists() and dc.stat().st_size > 1_000_000_000:
+            return str(vc), str(dc)
+
+    # Try conf-only match (glob for any content hash)
+    import glob as globmod
+    vc = cache_dir / f"vocab-{vocab_conf_h}-*.json"
+    vocab_matches = globmod.glob(str(vc))
+    for vm in sorted(vocab_matches):
+        vp = Path(vm)
+        if vp.stat().st_size <= 0:
+            continue
+        # Extract content hash from filename: vocab-{conf}-{content}.json
+        stem = vp.stem  # vocab-{conf}-{content}
+        parts = stem.split("-", 2)  # ['vocab', '{conf}', '{content}']
+        v_content_h = parts[2] if len(parts) > 2 else None
+        if v_content_h is None:
+            continue
+        # Now look for matching data cache
+        dc = cache_dir / f"data-{corpus_conf_h}-{v_content_h}-*.npy"
+        data_matches = globmod.glob(str(dc))
+        for dm in sorted(data_matches):
+            dp = Path(dm)
+            if dp.stat().st_size > 1_000_000_000:
+                return str(vp), str(dp)
+    return None
+
+
 def ensure_cache_ready(model_cfg, vocab_cfg, paths, force=False, tokenizer_sources=None, training_sources=None):
     """Pre-flight: ensure vocab + data cache exist before DDP spawn.
 
     If cache is missing, builds it in the caller process (blocking).
     Returns (vocab_cache_path, data_cache_path) tuple.
+
+    New cache naming: vocab-{vocab_conf_hash}-{vocab_hash}.json
+                       data-{corpus_conf_hash}-{vocab_hash}-{corpus_hash}.npy
+    Config-only hashes are checked first to skip data dir scanning.
     """
     data_dirs = [paths["data_dir"]]
     if "extra_data_dirs" in paths:
@@ -732,18 +796,33 @@ def ensure_cache_ready(model_cfg, vocab_cfg, paths, force=False, tokenizer_sourc
     cache_dir = Path(paths.get("cache_dir", "E:\\training\\cache"))
     cache_dir.mkdir(parents=True, exist_ok=True)
 
+    # Step 1: config-only hashes (no file I/O)
+    vocab_conf_h = get_vocab_conf_hash(vocab_cfg, tokenizer_sources)
+    corpus_conf_h = get_corpus_conf_hash(training_sources)
+
+    # Step 2: try config-only cache lookup
+    if not force:
+        hit = _try_conf_cache(cache_dir, vocab_conf_h, corpus_conf_h)
+        if hit:
+            vc, dc = hit
+            print(f"Cache ready (vocab conf={vocab_conf_h}, corpus conf={corpus_conf_h})", flush=True)
+            return vc, dc
+
+    # Step 3: content hashes (scan data dirs, file I/O)
     vocab_hash = get_vocab_hash(vocab_cfg, data_dirs)
     corpus_h = compute_corpus_hash(data_dirs)
 
-    vocab_cache = cache_dir / f"vocab-{vocab_hash}.json"
-    data_cache = cache_dir / f"data-{vocab_hash}-{corpus_h}.npy"
+    # Step 4: try full hash match
+    if not force:
+        hit = _try_conf_cache(cache_dir, vocab_conf_h, corpus_conf_h, vocab_hash, corpus_h)
+        if hit:
+            vc, dc = hit
+            print(f"Cache ready (vocab={vocab_hash}, corpus={corpus_h})", flush=True)
+            return vc, dc
 
-    vocab_ok = vocab_cache.exists() and vocab_cache.stat().st_size > 0
-    data_ok = data_cache.exists() and data_cache.stat().st_size > 1_000_000_000
-
-    if vocab_ok and data_ok and not force:
-        print(f"Cache ready (vocab={vocab_hash}, corpus={corpus_h})", flush=True)
-        return str(vocab_cache), str(data_cache)
+    # Step 5: build cache
+    vocab_cache = cache_dir / f"vocab-{vocab_conf_h}-{vocab_hash}.json"
+    data_cache = cache_dir / f"data-{corpus_conf_h}-{vocab_hash}-{corpus_h}.npy"
 
     print("[Cache build] Vocab or data cache missing — building now...", flush=True)
     print(f"  Vocab: {vocab_cache}", flush=True)
@@ -767,7 +846,7 @@ def ensure_cache_ready(model_cfg, vocab_cfg, paths, force=False, tokenizer_sourc
 
     # Build dataset (streaming — second pass over corpus)
     corpus_iter2 = SentenceIterator(paths["data_dir"], paths.get("extra_data_dirs"),
-                                    sources=training_sources)
+                                     sources=training_sources)
     dataset = WordDataset(corpus_iter2, tokenizer, model_cfg["seq_length"], cache_file=str(data_cache))
     print(f"Dataset built: {len(dataset)} samples -> {data_cache}", flush=True)
 
@@ -970,17 +1049,36 @@ def train():
     if "extra_data_dirs" in paths:
         data_dirs.extend(paths["extra_data_dirs"])
 
-    vocab_hash = get_vocab_hash(vocab_cfg, data_dirs)
-    if is_main:
-        print(f"Vocab hash: {vocab_hash}")
-
-    vocab_cache = cache_dir / f"vocab-{vocab_hash}.json"
-
-    corpus_h = compute_corpus_hash(data_dirs)
-    data_cache = cache_dir / f"data-{vocab_hash}-{corpus_h}.npy"
-
     tokenizer_sources = vocab_cfg.get("sources")
     training_sources = train_cfg.get("sources")
+
+    # Step 1: config-only hashes (no file I/O)
+    vocab_conf_h = get_vocab_conf_hash(vocab_cfg, tokenizer_sources)
+    corpus_conf_h = get_corpus_conf_hash(training_sources)
+
+    # Step 2: try config-only cache lookup (fast, no data dir scanning)
+    hit = _try_conf_cache(cache_dir, vocab_conf_h, corpus_conf_h)
+    if hit:
+        vocab_cache, data_cache = Path(hit[0]), Path(hit[1])
+        if is_main:
+            print(f"Cache ready (vocab conf={vocab_conf_h}, corpus conf={corpus_conf_h})", flush=True)
+
+    # Step 3: content hashes (scan data dirs, file I/O)
+    if not vocab_cache:
+        vocab_hash = get_vocab_hash(vocab_cfg, data_dirs)
+        if is_main:
+            print(f"Vocab hash: {vocab_hash}")
+        corpus_h = compute_corpus_hash(data_dirs)
+        hit = _try_conf_cache(cache_dir, vocab_conf_h, corpus_conf_h, vocab_hash, corpus_h)
+        if hit:
+            vocab_cache, data_cache = Path(hit[0]), Path(hit[1])
+            if is_main:
+                print(f"Cache ready (vocab={vocab_hash}, corpus={corpus_h})", flush=True)
+
+    # Step 4: fallback — will build cache
+    if not vocab_cache:
+        vocab_cache = cache_dir / f"vocab-{vocab_conf_h}-{vocab_hash}.json"
+        data_cache = cache_dir / f"data-{corpus_conf_h}-{vocab_hash}-{corpus_h}.npy"
 
     sentence_sample_cap = vocab_cfg.get("sentence_sample_cap", vocab_cfg.get("vocab_sample_cap", 25000000))
     pre_sample = vocab_cfg.get("pre_sample_per_source", 500)
@@ -1194,12 +1292,14 @@ def train():
                         _write_status(log_file, epoch, global_batch, avg, training_samples, model_cfg["seq_length"], training_start_time)
                         save_checkpoint(epoch, avg, combined_config, ckpt_hash, unwrapped_model, paths["checkpoint_dir"],
                                           optimizer=optimizer,
-                                          extra={"global_batch": global_batch, "batch_size": train_cfg["batch_size"],
-                                                 "seq_length": model_cfg["seq_length"], "training_samples": training_samples,
-                                                 "training_start_time": training_start_time,
-                                                 "vocab_size": tokenizer.vocab_size,
-                                                 "dataset_tokens": dataset.token_count,
-                                                  "dataset_samples": len(dataset)})
+                                           extra={"global_batch": global_batch, "batch_size": train_cfg["batch_size"],
+                                                  "seq_length": model_cfg["seq_length"], "training_samples": training_samples,
+                                                  "training_start_time": training_start_time,
+                                                  "vocab_conf_hash": vocab_conf_h,
+                                                  "corpus_conf_hash": corpus_conf_h,
+                                                  "vocab_size": tokenizer.vocab_size,
+                                                  "dataset_tokens": dataset.token_count,
+                                                   "dataset_samples": len(dataset)})
                     if dist.is_initialized():
                         dist.barrier()
                 except Exception as e:
@@ -1220,11 +1320,13 @@ def train():
                     save_checkpoint(epoch, avg_loss, combined_config, ckpt_hash, unwrapped_model, paths["checkpoint_dir"],
                                     optimizer=optimizer,
                                     extra={"global_batch": global_batch, "batch_size": train_cfg["batch_size"],
-                                           "seq_length": model_cfg["seq_length"], "training_samples": training_samples,
-                                           "training_start_time": training_start_time,
-                                           "vocab_size": tokenizer.vocab_size,
-                                           "dataset_tokens": dataset.token_count,
-                                           "dataset_samples": len(dataset)})
+                                            "seq_length": model_cfg["seq_length"], "training_samples": training_samples,
+                                            "training_start_time": training_start_time,
+                                            "vocab_conf_hash": vocab_conf_h,
+                                            "corpus_conf_hash": corpus_conf_h,
+                                            "vocab_size": tokenizer.vocab_size,
+                                            "dataset_tokens": dataset.token_count,
+                                            "dataset_samples": len(dataset)})
                 if dist.is_initialized():
                     dist.barrier()
             except Exception as e:

@@ -798,6 +798,71 @@ def test_vocab_hash_changes_on_vocab_size():
 
 
 # =============================================================================
+# CONFIG-ONLY HASH TESTS
+# =============================================================================
+def test_vocab_conf_hash_stable():
+    cfg = {"max_vocab_size": 32768, "sentence_sample_cap": 25000000}
+    sources = ["tinystories", "wikipedia_en_corpus"]
+    h1 = gpt_mini3.get_vocab_conf_hash(cfg, sources)
+    h2 = gpt_mini3.get_vocab_conf_hash(cfg, sources)
+    assert h1 == h2, "vocab_conf_hash must be stable"
+    assert len(h1) == 16
+    print("PASS: vocab_conf_hash_stable")
+
+
+def test_vocab_conf_hash_changes_on_sources():
+    cfg = {"max_vocab_size": 32768, "sentence_sample_cap": 25000000}
+    h1 = gpt_mini3.get_vocab_conf_hash(cfg, ["tinystories"])
+    h2 = gpt_mini3.get_vocab_conf_hash(cfg, ["tinystories", "wikipedia_en_corpus"])
+    assert h1 != h2, "vocab_conf_hash must change when sources change"
+    print("PASS: vocab_conf_hash_changes_on_sources")
+
+
+def test_corpus_conf_hash_stable():
+    sources = ["tinystories", "wikipedia_en_corpus", "chitanka_epub_corpus"]
+    h1 = gpt_mini3.get_corpus_conf_hash(sources)
+    h2 = gpt_mini3.get_corpus_conf_hash(sources)
+    assert h1 == h2, "corpus_conf_hash must be stable"
+    assert len(h1) == 16
+    print("PASS: corpus_conf_hash_stable")
+
+
+def test_corpus_conf_hash_changes_on_sources():
+    h1 = gpt_mini3.get_corpus_conf_hash(["tinystories"])
+    h2 = gpt_mini3.get_corpus_conf_hash(["tinystories", "wikipedia_en_corpus"])
+    assert h1 != h2, "corpus_conf_hash must change when sources change"
+    print("PASS: corpus_conf_hash_changes_on_sources")
+
+
+def test_try_conf_cache_miss():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cd = Path(tmpdir)
+        result = gpt_mini3._try_conf_cache(cd, "a1b2c3d4e5f61234", "1234567890abcdef")
+        assert result is None, "_try_conf_cache must return None for empty dir"
+    print("PASS: try_conf_cache_miss")
+
+
+def test_try_conf_cache_hit():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cd = Path(tmpdir)
+        # Create vocab cache
+        vc = cd / "vocab-a1b2c3d4e5f61234-d4e5f6a1b2c34567.json"
+        vc.write_text('{"test": true}')
+        # Create data cache (>1GB check — we use a small file, so this tests the glob logic)
+        # The actual _try_conf_cache checks size > 1GB, so we need to fake it
+        dc = cd / "data-1234567890abcdef-d4e5f6a1b2c34567-fedcba9876543210.npy"
+        dc.write_bytes(b"\x00" * 100)
+        # This won't pass the size check, so result should be None
+        result = gpt_mini3._try_conf_cache(cd, "a1b2c3d4e5f61234", "1234567890abcdef")
+        assert result is None, "_try_conf_cache must return None for small data file"
+        # Now test with exact match
+        result = gpt_mini3._try_conf_cache(cd, "a1b2c3d4e5f61234", "1234567890abcdef",
+                                           "d4e5f6a1b2c34567", "fedcba9876543210")
+        assert result is None, "_try_conf_cache must return None for small data file even with exact match"
+    print("PASS: try_conf_cache_hit")
+
+
+# =============================================================================
 # RUNNER
 # =============================================================================
 if __name__ == "__main__":
@@ -873,6 +938,12 @@ if __name__ == "__main__":
         test_checkpoint_multiple_models,
         test_vocab_hash_stable,
         test_vocab_hash_changes_on_vocab_size,
+        test_vocab_conf_hash_stable,
+        test_vocab_conf_hash_changes_on_sources,
+        test_corpus_conf_hash_stable,
+        test_corpus_conf_hash_changes_on_sources,
+        test_try_conf_cache_miss,
+        test_try_conf_cache_hit,
     ]
 
     passed = 0

@@ -142,11 +142,19 @@ never collide.
 ## Cache Files
 
 ```
-E:\training\cache\vocab-{vocab_hash}.json
-E:\training\cache\vocab-{vocab_hash}.meta.json
-E:\training\cache\data-{vocab_hash}-{corpus_h}.npy
-E:\training\cache\data-{vocab_hash}-{corpus_h}.meta.json
+E:\training\cache\vocab-{vocab_conf_hash}-{vocab_hash}.json
+E:\training\cache\vocab-{vocab_conf_hash}-{vocab_hash}.meta.json
+E:\training\cache\data-{corpus_conf_hash}-{vocab_hash}-{corpus_h}.npy
+E:\training\cache\data-{corpus_conf_hash}-{vocab_hash}-{corpus_h}.meta.json
 ```
+
+**Why the `{conf_hash}` prefix?** On resume, Python first globs the cache
+directory for files matching the config-only hashes (computed in <1ms).
+If a match exists, the expensive data-dir scans (`vocab_hash`, `corpus_h`)
+are skipped entirely. This reduces cold-start time from ~4s to <10ms.
+
+The `--cache-renew` CLI flag forces a full rebuild, ignoring any existing
+cache files regardless of hash match.
 
 ### `vocab.meta.json` Schema
 

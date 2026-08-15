@@ -706,6 +706,8 @@ def run():
                         help="Override checkpoint_every from config.")
     parser.add_argument("config", nargs="?", default="gpt_mini3.json",
                         help="Path to config JSON.")
+    parser.add_argument("--cache-renew", action="store_true",
+                        help="Force rebuild vocab + data cache, ignoring any existing cache")
     args = parser.parse_args()
 
     # Resolve GPU count WITHOUT touching CUDA (avoids corrupted context for mp.spawn on Windows)
@@ -733,6 +735,7 @@ def run():
     _paths = cfg.get("paths", {})
     _train_cfg = cfg.get("training", {})
     ensure_cache_ready(_model_cfg, _vocab_cfg, _paths,
+                        force=args.cache_renew,
                         tokenizer_sources=_vocab_cfg.get("sources"),
                         training_sources=_train_cfg.get("sources"))
 
