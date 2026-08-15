@@ -875,6 +875,63 @@ def get_model_hash(model, vocab_hash: str = None) -> str:
 
 
 # =============================================================================
+# 6a. CACHE LOCK & CURRENT CHECKPOINT
+# =============================================================================
+# cache_lock.json — stored inside checkpoint dir, records cache file basenames
+# Schema: { "vocab_cache": "vocab-...-... .json", "data_cache": "data-...-...-... .npy" }
+# current_checkpoint.json — stored in checkpoint dir root, records current ckpt_hash
+# Schema: { "ckpt_hash": "16hex", "epoch": N, "loss": F }
+
+def write_cache_lock(ckpt_hash_dir: str, vocab_cache_basename: str, data_cache_basename: str):
+    """Write cache_lock.json inside checkpoint dir with just the cache basenames."""
+    import json
+    from pathlib import Path
+    lock = Path(ckpt_hash_dir) / "cache_lock.json"
+    json.dump({
+        "vocab_cache": vocab_cache_basename,
+        "data_cache": data_cache_basename,
+    }, lock.open("w"), separators=(",", ":"))
+
+
+def read_cache_lock(ckpt_hash_dir: str) -> dict | None:
+    """Read cache_lock.json. Returns dict or None."""
+    import json
+    from pathlib import Path
+    lock = Path(ckpt_hash_dir) / "cache_lock.json"
+    if not lock.exists():
+        return None
+    try:
+        return json.loads(lock.read_text())
+    except Exception:
+        return None
+
+
+def write_current_checkpoint(ckpt_dir: str, ckpt_hash: str, epoch: int = 0, loss: float = 0.0):
+    """Write current_checkpoint.json in checkpoint dir root."""
+    import json
+    from pathlib import Path
+    ptr = Path(ckpt_dir) / "current_checkpoint.json"
+    json.dump({
+        "ckpt_hash": ckpt_hash,
+        "epoch": epoch,
+        "loss": round(loss, 6),
+    }, ptr.open("w"), separators=(",", ":"))
+
+
+def read_current_checkpoint(ckpt_dir: str) -> dict | None:
+    """Read current_checkpoint.json. Returns dict or None."""
+    import json
+    from pathlib import Path
+    ptr = Path(ckpt_dir) / "current_checkpoint.json"
+    if not ptr.exists():
+        return None
+    try:
+        return json.loads(ptr.read_text())
+    except Exception:
+        return None
+
+
+# =============================================================================
 # 6. CHECKPOINTING
 # =============================================================================
 # Layout: <ckpt_dir>/<model_hash>/          ← latest checkpoint + config (once)
@@ -944,7 +1001,9 @@ def _cleanup_corrupt_checkpoint(ckpt_dir: Path):
             p.unlink()
 
 
-def save_checkpoint(epoch: int, loss: float, config: dict, cfg_hash: str, model: GPTMini, ckpt_dir: str, optimizer=None, extra: dict | None = None):
+def save_checkpoint(epoch: int, loss: float, config: dict, cfg_hash: str, model: GPTMini, ckpt_dir: str,
+                    optimizer=None, extra: dict | None = None,
+                    vocab_cache_name: str | None = None, data_cache_name: str | None = None):
     base = Path(ckpt_dir) / cfg_hash
     needs_config = not (base / "config.json").exists()
     _write_tier(ckpt_dir, cfg_hash, 0, epoch, loss, config if needs_config else None, model, optimizer, extra)
@@ -953,6 +1012,11 @@ def save_checkpoint(epoch: int, loss: float, config: dict, cfg_hash: str, model:
         for t in tiers:
             _write_tier(ckpt_dir, cfg_hash, t, epoch, loss, None, model, None, extra)
         print(f"  -> Saved checkpoint at epoch {epoch} (tiers {', '.join(map(str, tiers))})")
+    # Write cache lock (just basenames) inside checkpoint dir
+    if vocab_cache_name and data_cache_name:
+        write_cache_lock(str(base), vocab_cache_name, data_cache_name)
+    # Write current checkpoint pointer in checkpoint dir root
+    write_current_checkpoint(ckpt_dir, cfg_hash, epoch, loss)
 
 
 def find_latest_checkpoint(ckpt_dir: str, expected_hash: str):
@@ -1006,6 +1070,186 @@ def _write_status(status_file, epoch, global_batch, loss, training_samples, seq_
     line = f"{time.strftime('%H:%M:%S')}\t{epoch}\t{global_batch}\t{loss:.4f}\t{tok_per_sec:.0f}\t{batch_per_sec:.1f}\t{training_samples}\n"
     status_file.write(line)
     status_file.flush()
+
+
+def resolve_checkpoint_and_cache(ckpt_dir: str, cache_dir: str,
+                                  vocab_conf_h: str, corpus_conf_h: str,
+                                  vocab_hash: str | None, corpus_h: str | None,
+                                  ckpt_hash: str | None) -> dict:
+    """Resolve checkpoint and cache paths using two-path logic.
+
+    Returns dict with keys:
+      ckpt_hash: the checkpoint hash to use
+      vocab_cache: Path to vocab cache file
+      data_cache: Path to data cache file
+      resume_info: dict from resume.json or None
+      start_epoch: int
+      global_batch: int
+
+    Path 1 — vocab_hash is computable (data files present):
+      1. Compute/verify ckpt_hash
+      2. Read/write current_checkpoint.json
+      3. Verify/fix cache_lock.json in checkpoint dir
+      4. Verify cache files exist, return paths
+
+    Path 2 — vocab_hash not computable (data files missing):
+      1. Read ckpt_hash from current_checkpoint.json
+      2. Verify checkpoint dir exists, else error
+      3. Read cache_lock.json from checkpoint dir
+      4. Verify cache files exist, else error
+    """
+    import sys
+    from pathlib import Path
+
+    ckpt_root = Path(ckpt_dir)
+    cache_root = Path(cache_dir)
+
+    if vocab_hash is not None:
+        # --- PATH 1: data present, can compute hashes ---
+        actual_ckpt = ckpt_hash if ckpt_hash else ""
+        if not actual_ckpt:
+            # Can't proceed without ckpt_hash
+            return {}
+
+        # Check/fix current_checkpoint.json
+        current = read_current_checkpoint(str(ckpt_root))
+        if current is None or current.get("ckpt_hash") != actual_ckpt:
+            write_current_checkpoint(str(ckpt_root), actual_ckpt)
+
+        # Check/fix cache_lock.json in checkpoint dir
+        ckpt_base = ckpt_root / actual_ckpt
+        if not ckpt_base.exists():
+            # No checkpoint yet, fresh start
+            return {
+                "ckpt_hash": actual_ckpt,
+                "vocab_cache": None,
+                "data_cache": None,
+                "resume_info": None,
+                "start_epoch": 0,
+                "global_batch": 0,
+            }
+
+        lock = read_cache_lock(str(ckpt_base))
+        if lock is None:
+            # Cache lock missing — can't resolve from lock alone
+            # Fall back to hash-based lookup
+            vc = _find_cache_by_hash(cache_root, vocab_conf_h, corpus_conf_h, vocab_hash, corpus_h)
+            if vc:
+                vocab_path, data_path = vc
+                write_cache_lock(str(ckpt_base), vocab_path.name, data_path.name)
+                vocab_cache = vocab_path
+                data_cache = data_path
+            else:
+                return {
+                    "ckpt_hash": actual_ckpt,
+                    "vocab_cache": None,
+                    "data_cache": None,
+                    "resume_info": None,
+                    "start_epoch": 0,
+                    "global_batch": 0,
+                }
+        else:
+            vocab_cache = cache_root / lock["vocab_cache"]
+            data_cache = cache_root / lock["data_cache"]
+            # Verify files exist
+            if not vocab_cache.exists() or vocab_cache.stat().st_size <= 0:
+                return {
+                    "ckpt_hash": actual_ckpt,
+                    "vocab_cache": None,
+                    "data_cache": None,
+                    "resume_info": None,
+                    "start_epoch": 0,
+                    "global_batch": 0,
+                }
+            if not data_cache.exists() or data_cache.stat().st_size <= 1_000_000_000:
+                return {
+                    "ckpt_hash": actual_ckpt,
+                    "vocab_cache": str(vocab_cache),
+                    "data_cache": None,
+                    "resume_info": None,
+                    "start_epoch": 0,
+                    "global_batch": 0,
+                }
+
+        # Resume info
+        start_epoch = 0
+        global_batch = 0
+        resume_info = None
+        ckpt = find_latest_checkpoint(str(ckpt_root), actual_ckpt)
+        if ckpt:
+            ep, info, _ = ckpt
+            start_epoch = ep
+            global_batch = int(info.get("global_batch", 0))
+            resume_info = info
+
+        return {
+            "ckpt_hash": actual_ckpt,
+            "vocab_cache": vocab_cache,
+            "data_cache": data_cache,
+            "resume_info": resume_info,
+            "start_epoch": start_epoch,
+            "global_batch": global_batch,
+        }
+
+    else:
+        # --- PATH 2: data missing, can't compute vocab_hash ---
+        current = read_current_checkpoint(str(ckpt_root))
+        if current is None:
+            print("[ERROR] Data files missing and no current_checkpoint.json found. "
+                  "Cannot determine checkpoint.", flush=True)
+            sys.exit(1)
+
+        actual_ckpt = current["ckpt_hash"]
+        ckpt_base = ckpt_root / actual_ckpt
+        if not ckpt_base.exists():
+            print(f"[ERROR] Checkpoint '{actual_ckpt}' referenced in current_checkpoint.json "
+                  f"does not exist at {ckpt_base}. "
+                  f"Delete checkpoints/current_checkpoint.json and retry.", flush=True)
+            sys.exit(1)
+
+        lock = read_cache_lock(str(ckpt_base))
+        if lock is None:
+            print(f"[ERROR] cache_lock.json missing in {ckpt_base}. "
+                  f"Cannot locate cache files without data dirs. "
+                  f"Recover cache_lock.json or restore data files to retry via path 1.", flush=True)
+            sys.exit(1)
+
+        vocab_cache = cache_root / lock["vocab_cache"]
+        data_cache = cache_root / lock["data_cache"]
+
+        if not vocab_cache.exists() or vocab_cache.stat().st_size <= 0:
+            print(f"[ERROR] Vocab cache missing: {vocab_cache}. "
+                  f"Recover cache files or restore data files to retry via path 1.", flush=True)
+            sys.exit(1)
+        if not data_cache.exists() or data_cache.stat().st_size <= 1_000_000_000:
+            print(f"[ERROR] Data cache missing or incomplete: {data_cache}. "
+                  f"Recover cache files or restore data files to retry via path 1.", flush=True)
+            sys.exit(1)
+
+        # Resume info
+        start_epoch = 0
+        global_batch = 0
+        resume_info = None
+        ckpt = find_latest_checkpoint(str(ckpt_root), actual_ckpt)
+        if ckpt:
+            ep, info, _ = ckpt
+            start_epoch = ep
+            global_batch = int(info.get("global_batch", 0))
+            resume_info = info
+
+        return {
+            "ckpt_hash": actual_ckpt,
+            "vocab_cache": vocab_cache,
+            "data_cache": data_cache,
+            "resume_info": resume_info,
+            "start_epoch": start_epoch,
+            "global_batch": global_batch,
+        }
+
+
+def _find_cache_by_hash(cache_dir, vocab_conf_h, corpus_conf_h, vocab_hash, corpus_h):
+    """Helper: find cache files by full hash match."""
+    return _try_conf_cache(cache_dir, vocab_conf_h, corpus_conf_h, vocab_hash, corpus_h)
 
 
 def train():
@@ -1291,15 +1535,17 @@ def train():
                     if is_main:
                         _write_status(log_file, epoch, global_batch, avg, training_samples, model_cfg["seq_length"], training_start_time)
                         save_checkpoint(epoch, avg, combined_config, ckpt_hash, unwrapped_model, paths["checkpoint_dir"],
-                                          optimizer=optimizer,
-                                           extra={"global_batch": global_batch, "batch_size": train_cfg["batch_size"],
-                                                  "seq_length": model_cfg["seq_length"], "training_samples": training_samples,
-                                                  "training_start_time": training_start_time,
-                                                  "vocab_conf_hash": vocab_conf_h,
-                                                  "corpus_conf_hash": corpus_conf_h,
-                                                  "vocab_size": tokenizer.vocab_size,
-                                                  "dataset_tokens": dataset.token_count,
-                                                   "dataset_samples": len(dataset)})
+                                           optimizer=optimizer,
+                                            extra={"global_batch": global_batch, "batch_size": train_cfg["batch_size"],
+                                                   "seq_length": model_cfg["seq_length"], "training_samples": training_samples,
+                                                   "training_start_time": training_start_time,
+                                                   "vocab_conf_hash": vocab_conf_h,
+                                                   "corpus_conf_hash": corpus_conf_h,
+                                                   "vocab_size": tokenizer.vocab_size,
+                                                   "dataset_tokens": dataset.token_count,
+                                                   "dataset_samples": len(dataset)},
+                                            vocab_cache_name=vocab_cache.name,
+                                            data_cache_name=data_cache.name)
                     if dist.is_initialized():
                         dist.barrier()
                 except Exception as e:
@@ -1326,7 +1572,9 @@ def train():
                                             "corpus_conf_hash": corpus_conf_h,
                                             "vocab_size": tokenizer.vocab_size,
                                             "dataset_tokens": dataset.token_count,
-                                            "dataset_samples": len(dataset)})
+                                            "dataset_samples": len(dataset)},
+                                    vocab_cache_name=vocab_cache.name,
+                                    data_cache_name=data_cache.name)
                 if dist.is_initialized():
                     dist.barrier()
             except Exception as e:

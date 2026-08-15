@@ -862,6 +862,64 @@ def test_try_conf_cache_hit():
     print("PASS: try_conf_cache_hit")
 
 
+def test_write_read_cache_lock():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ckpt = Path(tmpdir) / "abc123"
+        ckpt.mkdir()
+        gpt_mini3.write_cache_lock(str(ckpt), "vocab-x.json", "data-y.npy")
+        lock = gpt_mini3.read_cache_lock(str(ckpt))
+        assert lock is not None
+        assert lock["vocab_cache"] == "vocab-x.json"
+        assert lock["data_cache"] == "data-y.npy"
+    print("PASS: write_read_cache_lock")
+
+
+def test_read_cache_lock_missing():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        lock = gpt_mini3.read_cache_lock(tmpdir)
+        assert lock is None
+    print("PASS: read_cache_lock_missing")
+
+
+def test_write_read_current_checkpoint():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        gpt_mini3.write_current_checkpoint(tmpdir, "abc123def456", epoch=42, loss=0.5)
+        ptr = gpt_mini3.read_current_checkpoint(tmpdir)
+        assert ptr is not None
+        assert ptr["ckpt_hash"] == "abc123def456"
+        assert ptr["epoch"] == 42
+        assert ptr["loss"] == 0.5
+    print("PASS: write_read_current_checkpoint")
+
+
+def test_read_current_checkpoint_missing():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ptr = gpt_mini3.read_current_checkpoint(tmpdir)
+        assert ptr is None
+    print("PASS: read_current_checkpoint_missing")
+
+
+def test_save_checkpoint_writes_cache_lock():
+    """Verify save_checkpoint writes cache_lock.json when basenames provided."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model = gpt_mini3.GPTMini({"n_layer": 1, "n_head": 2, "head_dim": 8, "seq_length": 8}, 50)
+        config = {"model": {}, "training": {}}
+        h = gpt_mini3.get_model_hash(model)
+        gpt_mini3.save_checkpoint(1, 0.5, config, h, model, tmpdir,
+                                   vocab_cache_name="vocab-test.json",
+                                   data_cache_name="data-test.npy")
+        base = Path(tmpdir) / h
+        lock = gpt_mini3.read_cache_lock(str(base))
+        assert lock is not None
+        assert lock["vocab_cache"] == "vocab-test.json"
+        assert lock["data_cache"] == "data-test.npy"
+        ptr = gpt_mini3.read_current_checkpoint(tmpdir)
+        assert ptr is not None
+        assert ptr["ckpt_hash"] == h
+        assert ptr["epoch"] == 1
+    print("PASS: save_checkpoint_writes_cache_lock")
+
+
 # =============================================================================
 # RUNNER
 # =============================================================================
@@ -944,6 +1002,11 @@ if __name__ == "__main__":
         test_corpus_conf_hash_changes_on_sources,
         test_try_conf_cache_miss,
         test_try_conf_cache_hit,
+        test_write_read_cache_lock,
+        test_read_cache_lock_missing,
+        test_write_read_current_checkpoint,
+        test_read_current_checkpoint_missing,
+        test_save_checkpoint_writes_cache_lock,
     ]
 
     passed = 0

@@ -288,6 +288,53 @@ time	epoch	batch	loss	tok/s	batch/s	total_samples
 12:34:56	1	1000	4.5234	125000	15.3	64000
 ```
 
+### `cache_lock.json` Schema
+
+Stored inside each checkpoint directory. Records the cache file basenames used
+by that checkpoint. On resume, the trainer reads these basenames and prepends
+the configured `cache_dir` to locate the actual files.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `vocab_cache` | string | Basename of vocab cache (e.g. `vocab-a1b2-11b6.json`) |
+| `data_cache` | string | Basename of data cache (e.g. `data-566e-11b6-f69e.npy`) |
+
+**Example:**
+```json
+{"vocab_cache":"vocab-a9d7833c141af1b2-11b6add98fad06f1.json","data_cache":"data-566e43acfb5c5879-11b6add98fad06f1-f69edacea6f75f0e.npy"}
+```
+
+### `current_checkpoint.json` Schema
+
+Stored in the checkpoint directory root. Records the active checkpoint hash,
+allowing resume even when data files are missing (path 2).
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `ckpt_hash` | string | 16-char hex checkpoint hash |
+| `epoch` | int | Epoch at time of last save |
+| `loss` | float | Loss at time of last save |
+
+**Example:**
+```json
+{"ckpt_hash":"d4e5f6a1b2c34567","epoch":15,"loss":3.452100}
+```
+
+### Startup Resolution (Two Paths)
+
+**Path 1 — Data files present (can compute `vocab_hash`):**
+1. Compute `ckpt_hash` from model dims + `vocab_hash`
+2. Read/write `current_checkpoint.json` (update if hash changed)
+3. Read `cache_lock.json` from checkpoint dir; if missing, rebuild from hashes
+4. Verify cache files exist; if not, build them
+
+**Path 2 — Data files missing (cannot compute `vocab_hash`):**
+1. Read `ckpt_hash` from `current_checkpoint.json`
+2. If missing or checkpoint dir doesn't exist → exit with error
+3. Read `cache_lock.json` from checkpoint dir
+4. If missing or cache files don't exist → exit with error
+5. Resume training from cached data
+
 ---
 
 ## File Naming Summary
@@ -300,12 +347,14 @@ E:\training\data2\bulgarian-corpus-33b\chitanka.txt
 E:\training\data2\bulgarian-corpus-33b\chitanka.txt.meta.json
 
 # Cache
-E:\training\cache\vocab-{vocab_hash}.json
-E:\training\cache\vocab-{vocab_hash}.meta.json
-E:\training\cache\data-{vocab_hash}-{corpus_h}.npy
-E:\training\cache\data-{vocab_hash}-{corpus_h}.meta.json
+E:\training\cache\vocab-{vocab_conf_hash}-{vocab_hash}.json
+E:\training\cache\vocab-{vocab_conf_hash}-{vocab_hash}.meta.json
+E:\training\cache\data-{corpus_conf_hash}-{vocab_hash}-{corpus_h}.npy
+E:\training\cache\data-{corpus_conf_hash}-{vocab_hash}-{corpus_h}.meta.json
 
 # Checkpoints
+E:\training\checkpoints\current_checkpoint.json
+E:\training\checkpoints\{ckpt_hash}\cache_lock.json
 E:\training\checkpoints\{ckpt_hash}\model.pth
 E:\training\checkpoints\{ckpt_hash}\resume.json
 E:\training\checkpoints\{ckpt_hash}\config.json
@@ -319,16 +368,21 @@ E:\training\checkpoints\{ckpt_hash}\{tier}\...
 
 ```
 data files (*.txt)
-     │
-     ├─→ .meta.json (tier, language)
-     │
-     ├─→ vocab_hash  ───→ vocab-{hash}.json  +  vocab-{hash}.meta.json
-     │       │
-     │       └──→ data-{hash}-{corpus_h}.npy  +  data-{hash}-{corpus_h}.meta.json
-     │               │
-     │               └──→ corpus_h (full content hash)
-     │
-     └──→ ckpt_hash (= hash(model_dims, vocab_hash))  ───→ checkpoints/{hash}/
+      │
+      ├─→ .meta.json (tier, language)
+      │
+      ├─→ vocab_conf_hash ──→ vocab-{conf}-{hash}.json
+      │       │
+      │       └──→ vocab_hash (file metadata)
+      │
+      ├─→ corpus_conf_hash ──→ data-{conf}-{vhash}-{chash}.npy
+      │       │
+      │       └──→ corpus_h (content sampling)
+      │
+      └──→ ckpt_hash (= hash(model_dims, vocab_hash))  ───→ checkpoints/{hash}/
+              │
+              ├─→ cache_lock.json (vocab_cache, data_cache basenames)
+              └──→ checkpoints/current_checkpoint.json → {ckpt_hash}
 ```
 
 **Propagation rule:**  Changing any upstream input (data content, tier assignment,
@@ -356,7 +410,14 @@ via the new hash.
 | `get_vocab_hash()` | `(vocab_cfg: dict, data_dirs: list) -> str` | Yes — imported by DDP scripts |
 | `get_model_hash()` | `(model, vocab_hash: str = None) -> str` | Yes — imported by DDP scripts |
 | `compute_corpus_hash()` | `(data_dirs: list) -> str` | Yes — imported by DDP scripts |
+| `get_vocab_conf_hash()` | `(vocab_cfg: dict, sources: list) -> str` | Yes — config-only vocab hash |
+| `get_corpus_conf_hash()` | `(sources: list) -> str` | Yes — config-only corpus hash |
 | `ensure_cache_ready()` | `(model_cfg, vocab_cfg, paths, force, tokenizer_sources, training_sources) -> tuple[str, str]` | Yes — DDP pre-flight |
+| `write_cache_lock()` | `(ckpt_hash_dir, vocab_cache_name, data_cache_name)` | Yes — writes cache_lock.json |
+| `read_cache_lock()` | `(ckpt_hash_dir) -> dict \| None` | Yes — reads cache_lock.json |
+| `write_current_checkpoint()` | `(ckpt_dir, ckpt_hash, epoch, loss)` | Yes — writes pointer |
+| `read_current_checkpoint()` | `(ckpt_dir) -> dict \| None` | Yes — reads pointer |
+| `resolve_checkpoint_and_cache()` | `(ckpt_dir, cache_dir, vocab_conf_h, corpus_conf_h, vocab_hash, corpus_h, ckpt_hash) -> dict` | Yes — two-path resolver |
 | `SentenceIterator` | `(data_dir, extra_dirs, sources) -> Iterator[str]` | Yes — lazy sentence iterator |
 | `BPETokenizer.train()` | `(sources, tier_ratios, sentence_sample_cap, pre_sample_per_source)` | Yes — streaming BPE training |
 | `BPETokenizer.encode()` | `(text) -> list[int]` | Yes — full text encoding |
@@ -374,3 +435,4 @@ via the new hash.
 6. **Streaming pipeline** — `SentenceIterator` yields sentences lazily. No full corpus is loaded into memory. `BPETokenizer.train()` consumes the iterator and writes a sampled training file for SentencePiece. `WordDataset` streams from the iterator or from cached `.npy`.
 7. **Source filtering** — `tokenizer.sources` and `training.sources` config arrays allow different corpus subsets for vocab building vs. training. `SentenceIterator` filters files by name prefix.
 8. **Mtime-free hashes** — Neither hash function includes file modification time, ensuring stable cache names across file copies, transfers, and re-downloads.
+9. **Cache lock per checkpoint** — `cache_lock.json` lives inside each checkpoint dir, recording only cache file basenames. Combined with `current_checkpoint.json` at the root, this enables two-path resume: path 1 computes hashes from data files; path 2 reads the pointer and lock when data is missing.

@@ -21,7 +21,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from gpt_mini3 import (
     GPTMini, WordTokenizer, WordDataset, SentenceIterator,
     save_checkpoint, find_latest_checkpoint, generate_text, get_model_hash, get_vocab_hash,
-    compute_corpus_hash,
+    compute_corpus_hash, get_vocab_conf_hash, get_corpus_conf_hash,
     ensure_cache_ready,
     _write_status, _log_error,
     _cleanup_corrupt_checkpoint,
@@ -75,21 +75,24 @@ def load_config(config_path: str) -> tuple[dict, dict, dict, dict]:
     return model_cfg, vocab_cfg, train_cfg, paths
 
 
-def build_tokenizer_and_dataset(rank, world_size, model_cfg, vocab_cfg, train_cfg, paths):
+def build_tokenizer_and_dataset(rank, world_size, model_cfg, vocab_cfg, train_cfg, paths,
+                                tokenizer_sources=None, training_sources=None):
     """Build vocab + dataset. Rank 0 builds, others load from cache."""
     # Collect all data directories for vocab hash
     data_dirs = [paths["data_dir"]]
     if "extra_data_dirs" in paths:
         data_dirs.extend(paths["extra_data_dirs"])
 
+    vocab_conf_h = get_vocab_conf_hash(vocab_cfg, tokenizer_sources)
+    corpus_conf_h = get_corpus_conf_hash(training_sources)
     vocab_hash = get_vocab_hash(vocab_cfg, data_dirs)
 
     cache_dir = Path(paths.get("cache_dir", "E:\\training\\cache"))
     cache_dir.mkdir(parents=True, exist_ok=True)
-    vocab_cache = cache_dir / f"vocab-{vocab_hash}.json"
+    vocab_cache = cache_dir / f"vocab-{vocab_conf_h}-{vocab_hash}.json"
 
     corpus_h = compute_corpus_hash(data_dirs)
-    data_cache = cache_dir / f"data-{vocab_hash}-{corpus_h}.npy"
+    data_cache = cache_dir / f"data-{corpus_conf_h}-{vocab_hash}-{corpus_h}.npy"
     is_main = (rank == 0)
 
     tokenizer = WordTokenizer(
@@ -142,7 +145,7 @@ def build_tokenizer_and_dataset(rank, world_size, model_cfg, vocab_cfg, train_cf
     if is_main:
         print(f"Dataset (all ranks ready): {len(dataset)} samples", flush=True)
 
-    return tokenizer, dataset, vocab_hash
+    return tokenizer, dataset, vocab_hash, vocab_cache.name, data_cache.name
 
 
 def load_train_objs(tokenizer, dataset, model_cfg, device):
@@ -191,7 +194,8 @@ def prepare_dataloader(dataset, batch_size: int, rank: int, world_size: int):
 class Trainer:
     def __init__(self, model, train_data, sampler, optimizer, rank, world_size,
                   device, model_cfg, train_cfg, paths, ckpt_hash, combined_config,
-                  tokenizer, unwrapped_model, dataset_tokens=0, dataset_samples=0):
+                  tokenizer, unwrapped_model, dataset_tokens=0, dataset_samples=0,
+                  vocab_cache_name=None, data_cache_name=None):
         self.model = model
         self.train_data = train_data
         self.sampler = sampler
@@ -209,6 +213,8 @@ class Trainer:
         self.unwrapped_model = unwrapped_model
         self.dataset_tokens = dataset_tokens
         self.dataset_samples = dataset_samples
+        self.vocab_cache_name = vocab_cache_name
+        self.data_cache_name = data_cache_name
 
         # Checkpoint config (from 'training.checkpoint' block or legacy flat keys)
         ckpt_cfg = train_cfg.get("checkpoint", {})
@@ -359,7 +365,9 @@ class Trainer:
                                                 "training_start_time": self.training_start_time,
                                                 "vocab_size": self.tokenizer.vocab_size,
                                                 "dataset_tokens": self.dataset_tokens,
-                                                "dataset_samples": self.dataset_samples})
+                                                "dataset_samples": self.dataset_samples},
+                                        vocab_cache_name=self.vocab_cache_name,
+                                        data_cache_name=self.data_cache_name)
                     dist.barrier()
                     # No need to reload — DDP all_reduce already keeps weights in sync
                 except Exception as e:
@@ -385,7 +393,9 @@ class Trainer:
                                     "training_start_time": self.training_start_time,
                                     "vocab_size": self.tokenizer.vocab_size,
                                     "dataset_tokens": self.dataset_tokens,
-                                    "dataset_samples": self.dataset_samples})
+                                    "dataset_samples": self.dataset_samples},
+                            vocab_cache_name=self.vocab_cache_name,
+                            data_cache_name=self.data_cache_name)
         dist.barrier()
 
     def train(self, total_epochs: int, start_epoch: int = 0):
@@ -472,8 +482,10 @@ def run_ddp(rank: int, world_size: int, devices: tuple, master_port: str, config
         batch_size = train_cfg.get("batch_size", 16)
 
         # --- Build tokenizer + dataset ---
-        tokenizer, dataset, vocab_hash = build_tokenizer_and_dataset(
-            rank, world_size, model_cfg, vocab_cfg, train_cfg, paths
+        tokenizer, dataset, vocab_hash, vocab_cache_name, data_cache_name = build_tokenizer_and_dataset(
+            rank, world_size, model_cfg, vocab_cfg, train_cfg, paths,
+            tokenizer_sources=vocab_cfg.get("sources"),
+            training_sources=train_cfg.get("sources")
         )
 
         # --- Prepare dataloader (per tutorial) ---
@@ -499,7 +511,9 @@ def run_ddp(rank: int, world_size: int, devices: tuple, master_port: str, config
                             device, model_cfg, train_cfg, paths, ckpt_hash,
                             combined_config, tokenizer, unwrapped_model,
                             dataset_tokens=dataset.token_count,
-                            dataset_samples=len(dataset))
+                            dataset_samples=len(dataset),
+                            vocab_cache_name=vocab_cache_name,
+                            data_cache_name=data_cache_name)
         try:
             trainer.train(total_epochs)
         finally:
