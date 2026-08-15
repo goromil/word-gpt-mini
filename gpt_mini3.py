@@ -520,8 +520,8 @@ class BPEDataset(Dataset):
         return max(0, len(self.data) - self.seq_length)
 
     def __getitem__(self, idx):
-        x = self.data[idx:idx + self.seq_length]
-        y = self.data[idx + 1:idx + self.seq_length + 1]
+        x = self.data[idx:idx + self.seq_length].copy()
+        y = self.data[idx + 1:idx + self.seq_length + 1].copy()
         return x, y
 
 
