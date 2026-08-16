@@ -17,7 +17,7 @@
     },
     "sync": {
       "gradient_accumulation_steps": 128,
-      "method": "gpu",
+      "method": "cpu",
       "chunks": 16
     },
     "sources": [
