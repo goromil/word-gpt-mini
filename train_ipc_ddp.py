@@ -588,18 +588,24 @@ def _get_child_pids():
 
 
 def _kill_orphans():
-    """Kill only our spawned child processes on Windows."""
+    """Kill only our spawned child processes (cross-platform)."""
     pids = _get_child_pids()
     if not pids:
         print("[Cleanup] No child processes to terminate.", flush=True)
         return
     print(f"[Cleanup] Force-killing {len(pids)} child process(es): {pids}", flush=True)
+    is_windows = (os.name == "nt")
     for pid in pids:
         try:
-            res = subprocess.run(["taskkill", "/F", "/PID", str(pid)],
-                                capture_output=True, text=True, timeout=5)
-            if res.returncode != 0:
-                print(f"  taskkill PID {pid}: {res.stderr.strip()}", flush=True)
+            if is_windows:
+                res = subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                                    capture_output=True, text=True, timeout=5)
+                if res.returncode != 0:
+                    print(f"  taskkill PID {pid}: {res.stderr.strip()}", flush=True)
+            else:
+                os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass  # Already dead
         except Exception as e:
             print(f"  Failed to kill PID {pid}: {e}", flush=True)
     time.sleep(0.5)
