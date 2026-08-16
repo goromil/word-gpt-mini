@@ -317,6 +317,44 @@ estimation.
 - **Checkpointing** — batch/time/epoch triggers with global batch resume
 - **Resumable Downloads** — handles SSL interruptions, resumes from partial file
 
+## Services — Auto-Start Training (WSL2 + Task Scheduler)
+
+Automate training startup on PC boot via Windows Task Scheduler launching into WSL2.
+
+### Files
+
+| File | Purpose |
+|---|---|
+| `services/start.sh` | Bash script: activates conda `ai` env, runs `train_noipc_ddp.py`, logs to `E:\training\logs\` |
+| `services/start.ps1` | PowerShell wrapper: launches `start.sh` inside WSL2 via `nohup` (detached) |
+
+### How It Works
+
+1. PC boots → Task Scheduler fires `start.ps1` as SYSTEM
+2. `start.ps1` calls `wsl -d MACUBE` (auto-starts WSL if not running)
+3. `start.sh` activates conda `ai` env, runs training, appends log to `E:\training\logs\train_<timestamp>.log`
+4. `nohup` keeps training running after the Task Scheduler task exits
+
+### Setup (one-time)
+
+Run in **elevated PowerShell** (Admin):
+
+```powershell
+schtasks /Create /TN "WordGPT-Training" `
+  /TR "powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File `\"C:\Users\gorom\source\ai\word-gpt-mini\services\start.ps1`\"" `
+  /SC ONSTART /RU SYSTEM /RL HIGHEST /F
+```
+
+Run immediately without rebooting:
+
+```powershell
+schtasks /Run /TN "WordGPT-Training"
+```
+
+### Logs
+
+Each run creates a timestamped log: `/mnt/e/training/logs/train_YYYYMMDD_HHMMSS.log`
+
 ## Notes
 
 - BPE tokenization via SentencePiece. Vocab is trained on a sampled subset of the corpus.
