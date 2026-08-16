@@ -32,15 +32,13 @@ from gpt_mini3 import (
 # =============================================================================
 # 1. DISTRIBUTED SETUP  (gloo for CPU all_reduce only)
 # =============================================================================
-def dist_setup(rank: int, world_size: int, device: int, master_port: str):
-    """Init gloo for CPU all_reduce. No DDP wrapper, no CUDA IPC needed."""
+def dist_setup(rank: int, world_size: int, device: int, master_port: str, backend: str):
+    """Init process group with pre-resolved backend. No DDP wrapper, no CUDA IPC needed."""
     torch.cuda.set_device(device)
 
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = master_port
 
-    # Prefer NCCL for NVLink/P2P GPUs, fall back to gloo
-    backend = "nccl" if dist.is_nccl_available() else "gloo"
     try:
         _current_backend = backend
         dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
@@ -51,7 +49,7 @@ def dist_setup(rank: int, world_size: int, device: int, master_port: str):
 
     has_p2p = torch.cuda.can_device_access_peer(device, (device + 1) % 2)
     print(f"Rank {rank} -> cuda:{device} | {torch.cuda.get_device_name(device)}  "
-          f"(world_size={world_size}, P2P={has_p2p})")
+          f"(world_size={world_size}, backend={backend}, P2P={has_p2p})")
 
 
 # =============================================================================
@@ -114,14 +112,13 @@ def _allreduce_chunked(model):
     torch.cuda.synchronize()
 
 
-def all_reduce_grads(model, sync_method="cpu"):
-    """Dispatch to sync method. Default: cpu (gloo on Windows)."""
+def all_reduce_grads(model, backend: str, sync_method: str):
+    """Dispatch to sync method. Backend and sync_method are pre-resolved."""
     world_size = dist.get_world_size()
-    # Auto-correct: gloo cannot do GPU all_reduce
-    if sync_method != "cpu" and "gloo" in str(dist.get_backend()):
-        sync_method = "cpu"
     if world_size <= 1:
         return
+    if sync_method == "gpu" and backend != "nccl":
+        raise RuntimeError(f"sync_method='gpu' requires NCCL backend, got '{backend}'")
     if sync_method == "cpu":
         _allreduce_chunked(model)
     else:
@@ -262,7 +259,7 @@ def prepare_dataloader(dataset, batch_size: int, rank: int, world_size: int):
 class Trainer:
     def __init__(self, model, train_data, sampler, optimizer, rank, world_size,
                   device, model_cfg, train_cfg, paths, ckpt_hash, combined_config,
-                  tokenizer, dataset_tokens=0, dataset_samples=0,
+                  tokenizer, backend, sync_method, dataset_tokens=0, dataset_samples=0,
                   vocab_cache_name=None, data_cache_name=None):
         self.model = model
         self.train_data = train_data
@@ -291,8 +288,9 @@ class Trainer:
         sync_cfg = train_cfg.get("sync", {})
         self.grad_accum = sync_cfg.get("gradient_accumulation_steps",
                       train_cfg.get("gradient_accumulation_steps", 1))
-        self.sync_method = sync_cfg.get("method", "cpu")  # "cpu" (default) or "gpu" (NCCL only)
         self.sync_chunks = sync_cfg.get("chunks", 4)
+        self.backend = backend
+        self.sync_method = sync_method
         self.use_bf16 = torch.cuda.is_bf16_supported()
         self.log_interval = train_cfg.get("log_interval", 100)
 
@@ -393,7 +391,7 @@ class Trainer:
                 t_sync = 0.0
                 if (self.global_batch + 1) % self.grad_accum == 0:
                     t2 = time.time()
-                    all_reduce_grads(self.model, self.sync_method)
+                    all_reduce_grads(self.model, self.backend, self.sync_method)
                     self.optimizer.step()
                     self.optimizer.zero_grad(set_to_none=True)
                     t_sync = time.time() - t2
@@ -559,11 +557,16 @@ def run_ddp(rank: int, world_size: int, devices: tuple, master_port: str, config
         except (RuntimeError, AttributeError):
             pass
 
-        dist_setup(rank, world_size, device, master_port)
-        dist_initialized = True
-
         # --- Load config ---
         model_cfg, vocab_cfg, train_cfg, paths = load_config(config_path)
+        sync_cfg = train_cfg.get("sync", {})
+        sync_method = sync_cfg.get("method", "gpu")
+
+        # Resolve backend + sync_method once, before any dist calls
+        backend = "nccl" if dist.is_nccl_available() and sync_method == "gpu" else "gloo"
+
+        dist_setup(rank, world_size, device, master_port, backend=backend)
+        dist_initialized = True
 
         # Override from CLI
         if total_epochs > 0:
@@ -588,8 +591,8 @@ def run_ddp(rank: int, world_size: int, devices: tuple, master_port: str, config
         model = GPTMini(model_cfg, tokenizer.vocab_size).to(f"cuda:{device}")
 
         # --- Init sync buffers (cpu method only) ---
-        sync_cfg = train_cfg.get("sync", {})
-        sync_method = sync_cfg.get("method", "gpu")
+        # sync_cfg = train_cfg.get("sync", {})
+        # sync_method = sync_cfg.get("method", "gpu")
         if sync_method == "cpu" and world_size > 1:
             num_chunks = sync_cfg.get("chunks", 4)
             _build_chunked_buffers(model, num_chunks)
@@ -608,7 +611,7 @@ def run_ddp(rank: int, world_size: int, devices: tuple, master_port: str, config
         ckpt_hash = get_model_hash(model, vocab_hash)
         trainer = Trainer(model, train_data, sampler, optimizer, rank, world_size,
                             device, model_cfg, train_cfg, paths, ckpt_hash,
-                            combined_config, tokenizer,
+                            combined_config, tokenizer, backend, sync_method,
                             dataset_tokens=dataset.token_count,
                             dataset_samples=len(dataset),
                             vocab_cache_name=vocab_cache_name,

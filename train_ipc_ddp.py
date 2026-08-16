@@ -31,13 +31,14 @@ from gpt_mini3 import (
 # =============================================================================
 # 1. DDP SETUP  (exactly per PyTorch tutorial)
 # =============================================================================
-def ddp_setup(rank: int, world_size: int, device: int, master_port: str):
+def ddp_setup(rank: int, world_size: int, device: int, master_port: str, backend: str):
     """
     Args:
         rank:       Unique identifier of each process (0..world_size-1)
         world_size: Total number of processes
         device:     Actual CUDA device index this rank maps to
         master_port: TCP port for rendezvous
+        backend:    Pre-resolved backend string ('nccl' or 'gloo')
     """
     # Set device BEFORE init_process_group (prevents hangs / OOM on GPU:0)
     torch.cuda.set_device(device)
@@ -45,8 +46,6 @@ def ddp_setup(rank: int, world_size: int, device: int, master_port: str):
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = master_port
 
-    # Prefer NCCL for NVLink/P2P GPUs, fall back to gloo
-    backend = "nccl" if dist.is_nccl_available() else "gloo"
     try:
         _current_backend = backend
         dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
@@ -467,7 +466,10 @@ def run_ddp(rank: int, world_size: int, devices: tuple, master_port: str, config
         except (RuntimeError, AttributeError):
             pass
 
-        ddp_setup(rank, world_size, device, master_port)
+        # Resolve backend once, before any dist calls
+        backend = "nccl" if dist.is_nccl_available() else "gloo"
+
+        ddp_setup(rank, world_size, device, master_port, backend=backend)
         dist_initialized = True
 
         # --- Load config ---
