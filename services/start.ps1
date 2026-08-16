@@ -1,4 +1,26 @@
-# Launch training inside WSL2 from Task Scheduler (run as SYSTEM)
-# WSL auto-starts if not already running. nohup keeps training alive after this script exits.
+# Run training on Windows natively (conda env: ai)
+# Called by Task Scheduler (SYSTEM account)
 
-wsl -d MACUBE -u george nohup bash /home/george/source/ai/word-gpt-mini/services/start.sh >/dev/null 2>&1
+$ErrorActionPreference = "Stop"
+
+$PROJECT_DIR = "C:\Users\george\source\ai\word-gpt-mini"
+$CONFIG = "$PROJECT_DIR\gpt_mini3.json"
+$LOG_DIR = "E:\training\logs"
+$LOG_FILE = "$LOG_DIR\train_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+
+if (-not (Test-Path $LOG_DIR)) {
+    New-Item -ItemType Directory -Path $LOG_DIR -Force | Out-Null
+}
+
+"[$(Get-Date)] Training start" | Add-Content $LOG_FILE
+"Config: $CONFIG" | Add-Content $LOG_FILE
+"Log:    $LOG_FILE" | Add-Content $LOG_FILE
+"---" | Add-Content $LOG_FILE
+
+conda run -n ai --no-capture-output -p $PROJECT_DIR python train_noipc_ddp.py $CONFIG *>> $LOG_FILE
+$exitCode = $LASTEXITCODE
+
+"---" | Add-Content $LOG_FILE
+"[$(Get-Date)] Training exited with code $exitCode" | Add-Content $LOG_FILE
+
+exit $exitCode
