@@ -1,10 +1,10 @@
-# Run training on Windows natively (conda env: ai)
+﻿# Run training on Windows natively (conda env: ai)
 # Called by Task Scheduler (SYSTEM account)
 
 $ErrorActionPreference = "Stop"
 
 $PROJECT_DIR = "C:\Users\george\source\ai\word-gpt-mini"
-$CONFIG = "$PROJECT_DIR\gpt_mini3.json"
+$CONFIG = "$PROJECT_DIR\train_gpt.json"
 $LOG_DIR = "E:\training\logs"
 $LOG_FILE = "$LOG_DIR\train_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
 

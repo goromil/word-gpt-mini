@@ -1,4 +1,4 @@
-"""
+﻿"""
 Launcher for train_rpc.py — starts N independent processes (no mp.spawn).
 
 Each process gets a fresh CUDA context, avoiding the Windows
@@ -9,7 +9,7 @@ Usage:
     python launch_rpc.py -g 0,1,2,3                # GPUs 0-3
     python launch_rpc.py -g 0,1 --port 29500        # custom port
     python launch_rpc.py -g 0,1 --epochs 20         # override epochs
-    python launch_rpc.py -g 0,1 gpt_mini3.json      # custom config
+    python launch_rpc.py -g 0,1 train_gpt.json      # custom config
 """
 import subprocess
 import sys
@@ -31,7 +31,7 @@ def main():
                         help="Override epochs from config")
     parser.add_argument("--save_every", type=int, default=0,
                         help="Override checkpoint_every from config")
-    parser.add_argument("config", nargs="?", default="gpt_mini3.json",
+    parser.add_argument("config", nargs="?", default="train_gpt.json",
                         help="Path to config JSON")
     args = parser.parse_args()
 

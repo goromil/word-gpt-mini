@@ -1,4 +1,4 @@
-"""
+﻿"""
 Multi-GPU DDP trainer for NVLink/P2P GPUs (requires CUDA IPC).
 Requires P2P topology between GPUs (e.g. V100 SXM2, A100, H100).
 Will NOT work on PCIe-bridge GPUs like RTX 3090 (use train_noipc_ddp.py).
@@ -6,7 +6,7 @@ Will NOT work on PCIe-bridge GPUs like RTX 3090 (use train_noipc_ddp.py).
 Usage:
     python train_ipc_ddp.py                          # all CUDA GPUs, default config
     python train_ipc_ddp.py -d 0,1                   # GPUs 0 and 1
-    python train_ipc_ddp.py -d 0 gpt_mini3.json      # GPU 0 only, custom config
+    python train_ipc_ddp.py -d 0 train_gpt.json      # GPU 0 only, custom config
     python train_ipc_ddp.py --epochs 10 --save_every 3
 """
 import os, sys, json, time, hashlib, signal, subprocess
@@ -18,7 +18,7 @@ import torch.multiprocessing as mp
 from torch.utils.data import Sampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from gpt_mini3 import (
+from train_gpt import (
     GPTMini, WordTokenizer, WordDataset, SentenceIterator,
     save_checkpoint, find_latest_checkpoint, generate_text, get_model_hash, get_vocab_hash,
     compute_corpus_hash, get_vocab_conf_hash, get_corpus_conf_hash,
@@ -632,7 +632,7 @@ def run():
                         help="Override training epochs from config.")
     parser.add_argument("--save_every", type=int, default=0,
                         help="Override checkpoint_every from config.")
-    parser.add_argument("config", nargs="?", default="gpt_mini3.json",
+    parser.add_argument("config", nargs="?", default="train_gpt.json",
                         help="Path to config JSON.")
     parser.add_argument("--force", action="store_true",
                         help="Ignore P2P check and run anyway (will likely crash on non-P2P GPUs)")
@@ -692,7 +692,7 @@ def run():
 
     try:
         if world_size == 1:
-            # Single GPU: skip DDP, use gpt_mini3.train() directly (no dist.init_process_group)
+            # Single GPU: skip DDP, use train_gpt.train() directly (no dist.init_process_group)
             print(f"Single GPU detected ({devices[0]}), using direct training.", flush=True)
             # Apply CLI overrides via temp config (don't modify user's config)
             import tempfile
@@ -706,8 +706,8 @@ def run():
             json.dump(full_cfg, tmp_cfg, indent=2)
             tmp_cfg.close()
             try:
-                sys.argv = ["gpt_mini3.py", tmp_cfg.name]
-                from gpt_mini3 import train as run_single_gpu
+                sys.argv = ["train_gpt.py", tmp_cfg.name]
+                from train_gpt import train as run_single_gpu
                 run_single_gpu()
             finally:
                 os.unlink(tmp_cfg.name)

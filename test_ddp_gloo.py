@@ -1,10 +1,10 @@
-import os, sys, torch, json
+﻿import os, sys, torch, json
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 sys.path.insert(0, os.path.dirname(__file__))
-from gpt_mini3 import GPTMini, WordTokenizer
+from train_gpt import GPTMini, WordTokenizer
 
 def test_ddp(rank, world_size):
     torch.cuda.set_device(rank)
@@ -29,7 +29,7 @@ def test_ddp(rank, world_size):
         del tiny_ddp
 
         # Now test GPTMini
-        with open("gpt_mini3.json") as f:
+        with open("train_gpt.json") as f:
             cfg = json.load(f)
         model_cfg = dict(cfg["model"])
         vocab_cfg = cfg.get("tokenizer", cfg.get("vocab", {}))

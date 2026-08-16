@@ -1,4 +1,4 @@
-# RPC Gradient Sync — Experimental (Does Not Work on Windows)
+﻿# RPC Gradient Sync — Experimental (Does Not Work on Windows)
 
 ## Objective
 
@@ -70,7 +70,7 @@ DDP's `all_reduce` is ~1000x faster because gradients sync over PCIe/NVLink (~10
 - NCCL is compiled → GPU↔GPU sync over NVLink/PCIe, no `gloo` needed
 - `mp.spawn` works without context corruption
 
-**Migration is 0 lines of code.** Copy `train_ddp.py` + `gpt_mini3.py` + config to WSL2 and run:
+**Migration is 0 lines of code.** Copy `train_ddp.py` + `train_gpt.py` + config to WSL2 and run:
 ```bash
 python train_ddp.py -d 0,1
 ```
@@ -82,7 +82,7 @@ python train_ddp.py -d 0,1
 | `experimental/train_rpc.py` | TCP grad sync — serializes correctly, bandwidth impractical |
 | `experimental/launch_rpc.py` | Launcher for independent process training |
 | `train_ddp.py` | Works on Linux (WSL2), broken on Windows |
-| `gpt_mini3.py` | Single-GPU training, works everywhere |
+| `train_gpt.py` | Single-GPU training, works everywhere |
 
 ## Decision
 

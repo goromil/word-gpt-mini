@@ -1,19 +1,19 @@
-import json, math, sys, os
+﻿import json, math, sys, os
 
 
 # ---------------------------------------------------------------------------
 # CLI: python init_training.py [draft.json] [--download] [--scan-vocab] [--force]
-#   draft      = path to draft config (default: gpt_mini3_draft.json)
+#   draft      = path to draft config (default: train_gpt_draft.json)
 #   --download = download corpus automatically
 #   --scan-vocab = scan corpus to determine max_vocab_size (round up to pow 2)
-#   --force    = overwrite existing gpt_mini3.json
+#   --force    = overwrite existing train_gpt.json
 # ---------------------------------------------------------------------------
 FLAGS = {"--download", "--scan-vocab", "--force"}
 args = [a for a in sys.argv[1:] if a not in FLAGS]
 download = "--download" in sys.argv
 scan_vocab = "--scan-vocab" in sys.argv
 force = "--force" in sys.argv
-draft_path = args[0] if len(args) > 0 else "gpt_mini3_draft.json"
+draft_path = args[0] if len(args) > 0 else "train_gpt_draft.json"
 
 
 def next_pow2(x):
@@ -251,7 +251,7 @@ def main():
         "paths": paths
     }
 
-    out_file = "gpt_mini3.json"
+    out_file = "train_gpt.json"
 
     # Force check
     if os.path.exists(out_file) and not _force:

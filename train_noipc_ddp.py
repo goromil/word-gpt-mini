@@ -1,4 +1,4 @@
-"""
+﻿"""
 Multi-GPU trainer with manual CPU gradient sync.
 
 Root cause of DDP crash on Windows: gloo's all_reduce on CUDA tensors
@@ -8,7 +8,7 @@ PXB topology (no P2P). Fix: sync gradients via CPU where gloo works.
 Usage:
     python train_noipc_ddp.py                          # all CUDA GPUs, default config
     python train_noipc_ddp.py -d 0,1                   # GPUs 0 and 1
-    python train_noipc_ddp.py -d 0 gpt_mini3.json      # GPU 0 only, custom config
+    python train_noipc_ddp.py -d 0 train_gpt.json      # GPU 0 only, custom config
     python train_noipc_ddp.py --epochs 10 --save_every 3
 """
 import os, sys, json, time, hashlib, signal, subprocess
@@ -19,7 +19,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.utils.data import Sampler as DataSampler
 
-from gpt_mini3 import (
+from train_gpt import (
     GPTMini, WordTokenizer, WordDataset, SentenceIterator,
     save_checkpoint, find_latest_checkpoint, generate_text, get_model_hash, get_vocab_hash,
     compute_corpus_hash, get_vocab_conf_hash, get_corpus_conf_hash,
@@ -734,7 +734,7 @@ def run():
                         help="Override training epochs from config.")
     parser.add_argument("--save_every", type=int, default=0,
                         help="Override checkpoint_every from config.")
-    parser.add_argument("config", nargs="?", default="gpt_mini3.json",
+    parser.add_argument("config", nargs="?", default="train_gpt.json",
                         help="Path to config JSON.")
     parser.add_argument("--cache-renew", action="store_true",
                         help="Force rebuild vocab + data cache, ignoring any existing cache")
@@ -779,7 +779,7 @@ def run():
 
     try:
         if world_size == 1:
-            # Single GPU: skip DDP, use gpt_mini3.train() directly (no dist.init_process_group)
+            # Single GPU: skip DDP, use train_gpt.train() directly (no dist.init_process_group)
             print(f"Single GPU detected ({devices[0]}), using direct training.", flush=True)
             # Apply CLI overrides via temp config (don't modify user's config)
             import tempfile
@@ -793,8 +793,8 @@ def run():
             json.dump(full_cfg, tmp_cfg, indent=2)
             tmp_cfg.close()
             try:
-                sys.argv = ["gpt_mini3.py", tmp_cfg.name]
-                from gpt_mini3 import train as run_single_gpu
+                sys.argv = ["train_gpt.py", tmp_cfg.name]
+                from train_gpt import train as run_single_gpu
                 run_single_gpu()
             finally:
                 os.unlink(tmp_cfg.name)

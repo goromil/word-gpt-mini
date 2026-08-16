@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+﻿#!/usr/bin/env bash
 # Run training inside WSL2 (conda env: ai)
 # Called by start.ps1 via Task Scheduler (SYSTEM account)
 
@@ -6,7 +6,7 @@ set -euo pipefail
 
 PROJECT_DIR="/home/george/source/ai/word-gpt-mini"
 CONDA_BASE="/home/george/miniconda3"
-CONFIG="$PROJECT_DIR/wsl/gpt_mini3.json"
+CONFIG="$PROJECT_DIR/wsl/train_gpt.json"
 LOG_DIR="/mnt/e/training/logs"
 LOG_FILE="$LOG_DIR/train_$(date +%Y%m%d_%H%M%S).log"
 

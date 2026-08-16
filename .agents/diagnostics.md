@@ -1,4 +1,4 @@
-# Model & Training Debugger
+﻿# Model & Training Debugger
 
 ## Description
 Diagnoses training problems: loss anomalies, crashes, OOM errors, gradient issues, and hardware compatibility.
@@ -49,7 +49,7 @@ If stuck:
 ```bash
 python -c "
 import numpy as np, json
-cfg = json.load(open('gpt_mini3.json'))
+cfg = json.load(open('train_gpt.json'))
 d = np.load(cfg['paths']['cache_dir'] + '/data-*.npy')
 print(f'Unique tokens: {len(np.unique(d))}')
 print(f'Zeros (pad): {(d == 0).sum() / d.size * 100:.1f}%')
@@ -103,13 +103,13 @@ Trainer uses `127.0.0.1:29500` as master address on Windows.
 ### Step 3 — Verify model architecture
 ```bash
 # Check parameter count
-python calc_params.py gpt_mini3.json
+python calc_params.py train_gpt.json
 
 # Verify model loads
 python -c "
 import json, torch
-from gpt_mini3 import GPTMini
-cfg = json.load(open('gpt_mini3.json'))
+from train_gpt import GPTMini
+cfg = json.load(open('train_gpt.json'))
 model_cfg = dict(cfg['model'])
 model_cfg.pop('tokenizer', None)
 model = GPTMini(model_cfg, 65536)
@@ -123,7 +123,7 @@ print(f'Seq len: {model_cfg[\"seq_length\"]}')
 
 ### Step 4 — Run validation tests
 ```bash
-python test_gpt_mini3.py
+python test_train_gpt.py
 ```
 Expected: 71/71 pass, 0 fail.
 

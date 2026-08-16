@@ -1,4 +1,4 @@
-import sys
+﻿import sys
 import os
 import json
 import math
@@ -20,7 +20,7 @@ from torch.utils.data import Dataset, DataLoader, DistributedSampler
 def load_config(path=None):
     if path is None:
         import sys
-        path = sys.argv[1] if len(sys.argv) > 1 else "gpt_mini3.json"
+        path = sys.argv[1] if len(sys.argv) > 1 else "train_gpt.json"
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -1267,7 +1267,7 @@ def train():
     local_rank = setup_ddp() if in_ddp else 0
 
     # Load config - supports both combined and split formats
-    config_path = "gpt_mini3.json"
+    config_path = "train_gpt.json"
     if len(sys.argv) > 1:
         config_path = sys.argv[1]
     with open(config_path, "r") as f:
@@ -1434,7 +1434,7 @@ def train():
 
     # Write cache_lock.json at training start (rank 0)
     # Also write checkpoint pointer into config file (only for default config)
-    is_default_config = (os.path.basename(config_path) == "gpt_mini3.json")
+    is_default_config = (os.path.basename(config_path) == "train_gpt.json")
     if is_main:
         ckpt_base_dir = Path(paths["checkpoint_dir"]) / ckpt_hash
         ckpt_base_dir.mkdir(parents=True, exist_ok=True)

@@ -1,4 +1,4 @@
-# Corpus Download & Build
+﻿# Corpus Download & Build
 
 ## Description
 Manages the full data pipeline: downloading corpus from chitanka.info/Wikipedia, processing, tier assignment, and cache invalidation.
@@ -80,7 +80,7 @@ Tier allocation (from `CACHE_CHECKPOINT_SCHEMA.md`):
 | 3 | 12% | Tertiary language |
 
 ### Step 5 — Update source filtering
-Edit `gpt_mini3.json` to control which corpora are used:
+Edit `train_gpt.json` to control which corpora are used:
 ```json
 "tokenizer": {
     "sources": ["tinystories", "wikipedia_en_corpus", "chitanka_epub_corpus"]
@@ -96,8 +96,8 @@ Edit `gpt_mini3.json` to control which corpora are used:
 # Check current hashes
 python -c "
 import json, hashlib
-from gpt_mini3 import get_vocab_hash, compute_corpus_hash
-cfg = json.load(open('gpt_mini3.json'))
+from train_gpt import get_vocab_hash, compute_corpus_hash
+cfg = json.load(open('train_gpt.json'))
 dirs = [cfg['paths']['data_dir']]
 vh = get_vocab_hash(cfg['tokenizer'], dirs)
 ch = compute_corpus_hash(dirs)

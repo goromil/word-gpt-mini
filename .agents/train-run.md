@@ -1,4 +1,4 @@
-# Training Lifecycle Manager
+﻿# Training Lifecycle Manager
 
 ## Description
 Manages the full training lifecycle: pre-flight checks, cache building, trainer selection, launch, monitoring, and resume.
@@ -10,8 +10,8 @@ Manages the full training lifecycle: pre-flight checks, cache building, trainer 
 
 ### Step 1 — Verify config exists and is valid
 ```bash
-python -m py_compile gpt_mini3.json  # not needed, it's JSON
-python -c "import json; json.load(open('gpt_mini3.json'))"  # validate
+python -m py_compile train_gpt.json  # not needed, it's JSON
+python -c "import json; json.load(open('train_gpt.json'))"  # validate
 ```
 If missing or broken, suggest `python train_designer.py --no-interact --force` to regenerate.
 
@@ -49,7 +49,7 @@ This calls `ensure_cache_ready()` which builds vocab + data cache if missing.
 python train_noipc_ddp.py -d 0,1
 
 # Custom config, single GPU
-python train_noipc_ddp.py -d 0 gpt_mini3.json
+python train_noipc_ddp.py -d 0 train_gpt.json
 
 # Override epochs
 python train_noipc_ddp.py -d 0,1 --epochs 20
@@ -90,7 +90,7 @@ After force-kill, next launch will resume from last saved checkpoint (not curren
 ## Key Files
 | File | Purpose |
 |------|---------|
-| `gpt_mini3.json` | Working config with model/training/tokenizer/paths |
+| `train_gpt.json` | Working config with model/training/tokenizer/paths |
 | `train_noipc_ddp.py` | CPU-sync trainer (RTX 3090) |
 | `train_ipc_ddp.py` | Full DDP trainer (NVLink) |
 | `experimental/train_rpc.py` | TCP-sync trainer (experimental) |

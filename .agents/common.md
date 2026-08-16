@@ -1,4 +1,4 @@
-# Common Patterns & Conventions
+﻿# Common Patterns & Conventions
 
 ## Description
 Shared patterns used across all skills: GPU detection, config loading, WSL path translation, environment setup.
@@ -15,10 +15,10 @@ python <script.py>
 ```
 Environment is `ai` under miniconda3 in WSL. `sentencepiece` must be installed.
 
-### Config loading (matches `gpt_mini3.py:947-957`)
+### Config loading (matches `train_gpt.py:947-957`)
 ```python
 import json
-cfg = json.load(open('gpt_mini3.json'))
+cfg = json.load(open('train_gpt.json'))
 
 # Model config (without tokenizer sub-keys)
 model_cfg = dict(cfg['model'])
@@ -44,7 +44,7 @@ In current config, `extra_data_dirs` is absent; all data is in `data_dir`.
 
 ### Hash functions
 ```python
-from gpt_mini3 import get_vocab_hash, compute_corpus_hash, get_model_hash
+from train_gpt import get_vocab_hash, compute_corpus_hash, get_model_hash
 
 # Vocab hash: tokenizer config + file metadata (size, tier, NO mtime)
 vh = get_vocab_hash(vocab_cfg, data_dirs)

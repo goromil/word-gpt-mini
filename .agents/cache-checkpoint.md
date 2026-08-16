@@ -1,4 +1,4 @@
-# Cache & Checkpoint Inspector
+﻿# Cache & Checkpoint Inspector
 
 ## Description
 Inspects, validates, and manages cache files and checkpoints: hash chain verification, tier inspection, stale cache detection, cleanup.
@@ -27,10 +27,10 @@ Get-ChildItem "E:\training\cache" -Filter "data-*.npy" | ForEach-Object {
 ```bash
 python -c "
 import json
-from gpt_mini3 import get_vocab_hash, compute_corpus_hash
+from train_gpt import get_vocab_hash, compute_corpus_hash
 from pathlib import Path
 
-cfg = json.load(open('gpt_mini3.json'))
+cfg = json.load(open('train_gpt.json'))
 dirs = [cfg['paths']['data_dir']]
 
 # Compute current hashes
@@ -95,11 +95,11 @@ Higher tiers use static `model.pth`.
 ```bash
 python -c "
 import json, hashlib
-from gpt_mini3 import get_vocab_hash, compute_corpus_hash, get_model_hash
+from train_gpt import get_vocab_hash, compute_corpus_hash, get_model_hash
 import torch
-from gpt_mini3 import GPTMini
+from train_gpt import GPTMini
 
-cfg = json.load(open('gpt_mini3.json'))
+cfg = json.load(open('train_gpt.json'))
 model_cfg = dict(cfg['model'])
 model_cfg.pop('tokenizer', None)
 dirs = [cfg['paths']['data_dir']]
@@ -127,9 +127,9 @@ print(f'Expected ckpt dir: checkpoints/{ckpt_h}/')
 python -c "
 from pathlib import Path
 import json, os
-from gpt_mini3 import get_vocab_hash, compute_corpus_hash
+from train_gpt import get_vocab_hash, compute_corpus_hash
 
-cfg = json.load(open('gpt_mini3.json'))
+cfg = json.load(open('train_gpt.json'))
 dirs = [cfg['paths']['data_dir']]
 
 current_vh = get_vocab_hash(cfg['tokenizer'], dirs)
@@ -167,9 +167,9 @@ for data_file in cache_dir.glob('data-*.npy'):
 python -c "
 from pathlib import Path
 import json
-from gpt_mini3 import get_vocab_hash, compute_corpus_hash
+from train_gpt import get_vocab_hash, compute_corpus_hash
 
-cfg = json.load(open('gpt_mini3.json'))
+cfg = json.load(open('train_gpt.json'))
 dirs = [cfg['paths']['data_dir']]
 current_vh = get_vocab_hash(cfg['tokenizer'], dirs)
 current_ch = compute_corpus_hash(dirs)
