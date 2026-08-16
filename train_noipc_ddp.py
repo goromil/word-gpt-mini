@@ -62,7 +62,8 @@ def _allreduce_gpu(model):
     Use only with NCCL backend."""
     for p in model.parameters():
         if p.grad is not None:
-            dist.all_reduce(p.grad.data, op=dist.ReduceOp.AVG)
+            dist.all_reduce(p.grad.data, op=dist.ReduceOp.SUM)
+            p.grad.data.div_(dist.get_world_size())
 
 
 def _build_chunked_buffers(model, num_chunks):
@@ -104,7 +105,8 @@ def _allreduce_chunked(model):
         grads = [p.grad.data for p in cp]
         flat = torch._utils._flatten_dense_tensors(grads)
         buf[:flat.numel()].copy_(flat)  # blocking GPU→CPU
-        dist.all_reduce(buf[:buf.numel()], op=dist.ReduceOp.AVG)
+        dist.all_reduce(buf[:buf.numel()], op=dist.ReduceOp.SUM)
+        buf[:buf.numel()].div_(dist.get_world_size())
         split = torch._utils._unflatten_dense_tensors(buf[:buf.numel()], grads)
         for p, g in zip(cp, split):
             p.grad.data.copy_(g)  # blocking CPU→GPU
