@@ -48,7 +48,8 @@ def ddp_setup(rank: int, world_size: int, device: int, master_port: str):
     # Prefer NCCL for NVLink/P2P GPUs, fall back to gloo
     backend = "nccl" if dist.is_nccl_available() else "gloo"
     try:
-        dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+        _current_backend = backend
+        dist.init_process_group(backend=backend, rank=rank, world_size=world_size, device_ids=[device])
     except RuntimeError as e:
         if "built in" in str(e):
             raise RuntimeError(f"Backend '{backend}' not compiled. Install torch with NCCL support or use gloo.") from e

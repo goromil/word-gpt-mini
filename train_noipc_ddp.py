@@ -39,9 +39,11 @@ def dist_setup(rank: int, world_size: int, device: int, master_port: str):
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = master_port
 
-    backend = "gloo"
+    # Prefer NCCL for NVLink/P2P GPUs, fall back to gloo
+    backend = "nccl" if dist.is_nccl_available() else "gloo"
     try:
-        dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+        _current_backend = backend
+        dist.init_process_group(backend=backend, rank=rank, world_size=world_size, device_ids=[device])
     except RuntimeError as e:
         if "built in" in str(e):
             raise RuntimeError(f"Backend '{backend}' not compiled.") from e
@@ -115,6 +117,9 @@ def _allreduce_chunked(model):
 def all_reduce_grads(model, sync_method="cpu"):
     """Dispatch to sync method. Default: cpu (gloo on Windows)."""
     world_size = dist.get_world_size()
+    # Auto-correct: gloo cannot do GPU all_reduce
+    if sync_method != "cpu" and "gloo" in str(dist.get_backend()):
+        sync_method = "cpu"
     if world_size <= 1:
         return
     if sync_method == "cpu":
