@@ -43,7 +43,10 @@ def dist_setup(rank: int, world_size: int, device: int, master_port: str):
     backend = "nccl" if dist.is_nccl_available() else "gloo"
     try:
         _current_backend = backend
-        dist.init_process_group(backend=backend, rank=rank, world_size=world_size, device_ids=[device])
+        if backend == "nccl":
+            dist.init_process_group(backend=backend, rank=rank, world_size=world_size, device_ids=[device])
+        else:
+            dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
     except RuntimeError as e:
         if "built in" in str(e):
             raise RuntimeError(f"Backend '{backend}' not compiled.") from e
