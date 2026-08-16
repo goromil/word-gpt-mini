@@ -638,7 +638,41 @@ def run():
                         help="Ignore P2P check and run anyway (will likely crash on non-P2P GPUs)")
     parser.add_argument("--cache-renew", action="store_true",
                         help="Force rebuild vocab + data cache, ignoring any existing cache")
+    parser.add_argument("--checkpoint-hash", "-CkptHash", "-CheckpointHash",
+                        metavar="HASH", default=None,
+                        help="Resume from checkpoint <checkpoint_dir>/<HASH>")
+    parser.add_argument("--checkpoint-path", "-CkptPath", "-CheckpointPath",
+                        metavar="PATH", default=None,
+                        help="Resume from checkpoint at given path")
     args = parser.parse_args()
+
+    # Resolve checkpoint config (shared logic from gpt_train)
+    from gpt_train import resolve_checkpoint_config
+    resolved = resolve_checkpoint_config(
+        args.config,
+        checkpoint_hash=args.checkpoint_hash,
+        checkpoint_path=args.checkpoint_path,
+        epochs=args.epochs,
+        save_every=args.save_every,
+    )
+    effective_config = resolved["config"]
+    effective_config_path = resolved["config_path"]
+
+    # Write temp config with overrides for downstream code
+    import tempfile
+    tmp_cfg = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
+    json.dump(effective_config, tmp_cfg, indent=2)
+    tmp_cfg.close()
+
+    # Pre-flight: ensure vocab + data cache exist before spawning DDP
+    _model_cfg = dict(effective_config.get("model", {}))
+    _vocab_cfg = effective_config.get("tokenizer", effective_config.get("vocab", {}))
+    _paths = effective_config.get("paths", {})
+    _train_cfg = effective_config.get("training", {})
+    ensure_cache_ready(_model_cfg, _vocab_cfg, _paths,
+                        force=args.cache_renew,
+                        tokenizer_sources=_vocab_cfg.get("sources"),
+                        training_sources=_train_cfg.get("sources"))
 
     # Resolve GPU count WITHOUT touching CUDA (avoids corrupted context for mp.spawn on Windows)
     cuda_count = _get_cuda_device_count()
@@ -656,18 +690,6 @@ def run():
         devices = tuple(range(cuda_count))
 
     world_size = len(devices)
-
-    # Pre-flight: ensure vocab + data cache exist before spawning DDP
-    with open(args.config, "r") as f:
-        cfg = json.load(f)
-    _model_cfg = dict(cfg.get("model", {}))
-    _vocab_cfg = cfg.get("tokenizer", cfg.get("vocab", {}))
-    _paths = cfg.get("paths", {})
-    _train_cfg = cfg.get("training", {})
-    ensure_cache_ready(_model_cfg, _vocab_cfg, _paths,
-                        force=args.cache_renew,
-                        tokenizer_sources=_vocab_cfg.get("sources"),
-                        training_sources=_train_cfg.get("sources"))
 
     # Pre-flight P2P check (only for multi-GPU)
     if world_size > 1:
@@ -694,17 +716,6 @@ def run():
         if world_size == 1:
             # Single GPU: skip DDP, use gpt_train.train() directly (no dist.init_process_group)
             print(f"Single GPU detected ({devices[0]}), using direct training.", flush=True)
-            # Apply CLI overrides via temp config (don't modify user's config)
-            import tempfile
-            with open(args.config, "r") as f:
-                full_cfg = json.load(f)
-            if args.epochs > 0:
-                full_cfg.setdefault("training", {})["epochs"] = args.epochs
-            if args.save_every > 0:
-                full_cfg.setdefault("training", {}).setdefault("checkpoint", {})["every_epoch"] = args.save_every
-            tmp_cfg = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
-            json.dump(full_cfg, tmp_cfg, indent=2)
-            tmp_cfg.close()
             try:
                 sys.argv = ["gpt_train.py", tmp_cfg.name]
                 from gpt_train import train as run_single_gpu
@@ -713,20 +724,24 @@ def run():
                 os.unlink(tmp_cfg.name)
             return
         else:
+            # Multi-GPU: spawn DDP workers
             mp.set_sharing_strategy("file_system")
             mp.spawn(run_ddp,
-                      args=(world_size, devices, args.port, args.config,
-                            args.epochs, args.save_every),
+                      args=(world_size, devices, args.port, tmp_cfg.name,
+                            0, 0),  # epochs/save_every already applied in resolved config
                       nprocs=world_size,
                       start_method="spawn",
                       join=True)
-    except KeyboardInterrupt:
-        print("\n[Ctrl+C] Shutting down...")
-        _kill_orphans()
-        time.sleep(1)
-        sys.exit(1)
-    except Exception as e:
-        print(f"\n[ERROR] Training failed: {e}", flush=True)
+            os.unlink(tmp_cfg.name)
+    except (KeyboardInterrupt, Exception) as e:
+        try:
+            os.unlink(tmp_cfg.name)
+        except FileNotFoundError:
+            pass
+        if isinstance(e, KeyboardInterrupt):
+            print("\n[Ctrl+C] Shutting down...")
+        else:
+            print(f"\n[ERROR] Training failed: {e}", flush=True)
         _kill_orphans()
         time.sleep(1)
         sys.exit(1)

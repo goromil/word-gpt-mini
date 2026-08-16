@@ -881,24 +881,6 @@ def test_read_cache_lock_missing():
     print("PASS: read_cache_lock_missing")
 
 
-def test_write_read_current_checkpoint():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        gpt_train.write_current_checkpoint(tmpdir, "abc123def456", epoch=42, loss=0.5)
-        ptr = gpt_train.read_current_checkpoint(tmpdir)
-        assert ptr is not None
-        assert ptr["ckpt_hash"] == "abc123def456"
-        assert ptr["epoch"] == 42
-        assert ptr["loss"] == 0.5
-    print("PASS: write_read_current_checkpoint")
-
-
-def test_read_current_checkpoint_missing():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        ptr = gpt_train.read_current_checkpoint(tmpdir)
-        assert ptr is None
-    print("PASS: read_current_checkpoint_missing")
-
-
 def test_save_checkpoint_writes_cache_lock():
     """Verify save_checkpoint writes cache_lock.json when basenames provided."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -906,17 +888,13 @@ def test_save_checkpoint_writes_cache_lock():
         config = {"model": {}, "training": {}}
         h = gpt_train.get_model_hash(model)
         gpt_train.save_checkpoint(1, 0.5, config, h, model, tmpdir,
-                                   vocab_cache_name="vocab-test.json",
-                                   data_cache_name="data-test.npy")
+                                    vocab_cache_name="vocab-test.json",
+                                    data_cache_name="data-test.npy")
         base = Path(tmpdir) / h
         lock = gpt_train.read_cache_lock(str(base))
         assert lock is not None
         assert lock["vocab_cache"] == "vocab-test.json"
         assert lock["data_cache"] == "data-test.npy"
-        ptr = gpt_train.read_current_checkpoint(tmpdir)
-        assert ptr is not None
-        assert ptr["ckpt_hash"] == h
-        assert ptr["epoch"] == 1
     print("PASS: save_checkpoint_writes_cache_lock")
 
 
@@ -1004,8 +982,6 @@ if __name__ == "__main__":
         test_try_conf_cache_hit,
         test_write_read_cache_lock,
         test_read_cache_lock_missing,
-        test_write_read_current_checkpoint,
-        test_read_current_checkpoint_missing,
         test_save_checkpoint_writes_cache_lock,
     ]
 

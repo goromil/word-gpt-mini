@@ -879,8 +879,6 @@ def get_model_hash(model, vocab_hash: str = None) -> str:
 # =============================================================================
 # cache_lock.json — stored inside checkpoint dir, records cache file basenames
 # Schema: { "vocab_cache": "vocab-...-... .json", "data_cache": "data-...-...-... .npy" }
-# current_checkpoint.json — stored in checkpoint dir root, records current ckpt_hash
-# Schema: { "ckpt_hash": "16hex", "epoch": N, "loss": F }
 
 def write_cache_lock(ckpt_hash_dir: str, vocab_cache_basename: str, data_cache_basename: str):
     """Write cache_lock.json inside checkpoint dir with just the cache basenames."""
@@ -902,31 +900,6 @@ def read_cache_lock(ckpt_hash_dir: str) -> dict | None:
         return None
     try:
         return json.loads(lock.read_text())
-    except Exception:
-        return None
-
-
-def write_current_checkpoint(ckpt_dir: str, ckpt_hash: str, epoch: int = 0, loss: float = 0.0):
-    """Write current_checkpoint.json in checkpoint dir root."""
-    import json
-    from pathlib import Path
-    ptr = Path(ckpt_dir) / "current_checkpoint.json"
-    json.dump({
-        "ckpt_hash": ckpt_hash,
-        "epoch": epoch,
-        "loss": round(loss, 6),
-    }, ptr.open("w"), separators=(",", ":"))
-
-
-def read_current_checkpoint(ckpt_dir: str) -> dict | None:
-    """Read current_checkpoint.json. Returns dict or None."""
-    import json
-    from pathlib import Path
-    ptr = Path(ckpt_dir) / "current_checkpoint.json"
-    if not ptr.exists():
-        return None
-    try:
-        return json.loads(ptr.read_text())
     except Exception:
         return None
 
@@ -1022,8 +995,6 @@ def save_checkpoint(epoch: int, loss: float, config: dict, cfg_hash: str, model:
     # Write cache lock (just basenames) inside checkpoint dir
     if vocab_cache_name and data_cache_name:
         write_cache_lock(str(base), vocab_cache_name, data_cache_name)
-    # Write current checkpoint pointer in checkpoint dir root
-    write_current_checkpoint(ckpt_dir, cfg_hash, epoch, loss)
 
 
 def find_latest_checkpoint(ckpt_dir: str, expected_hash: str):
@@ -1074,204 +1045,133 @@ def _write_status(status_file, epoch, global_batch, loss, training_samples, seq_
     elapsed = time.time() - training_start_time
     tok_per_sec = training_samples * seq_length / elapsed
     batch_per_sec = global_batch / elapsed
-    line = f"{time.strftime('%H:%M:%S')}\t{epoch}\t{global_batch}\t{loss:.4f}\t{tok_per_sec:.0f}\t{batch_per_sec:.1f}\t{training_samples}\n"
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{epoch}\t{global_batch}\t{loss:.4f}\t{tok_per_sec:.0f}\t{batch_per_sec:.1f}\t{training_samples}\n"
     status_file.write(line)
     status_file.flush()
 
 
-def resolve_checkpoint_and_cache(ckpt_dir: str, cache_dir: str,
-                                  vocab_conf_h: str, corpus_conf_h: str,
-                                  vocab_hash: str | None, corpus_h: str | None,
-                                  ckpt_hash: str | None) -> dict:
-    """Resolve checkpoint and cache paths using two-path logic.
+def resolve_checkpoint_config(config_path: str, checkpoint_hash: str | None = None,
+                               checkpoint_path: str | None = None,
+                               epochs: int = 0, save_every: int = 0):
+    """Resolve effective config from checkpoint or default config file.
 
-    Returns dict with keys:
-      ckpt_hash: the checkpoint hash to use
-      vocab_cache: Path to vocab cache file
-      data_cache: Path to data cache file
-      resume_info: dict from resume.json or None
-      start_epoch: int
-      global_batch: int
+    Args:
+        config_path: path to default config (read-only, used for checkpoint_dir)
+        checkpoint_hash: checkpoint hash to resume from (relative to checkpoint_dir)
+        checkpoint_path: absolute path to checkpoint directory
+        epochs: override epochs in config (0 = no override)
+        save_every: override checkpoint_every in config (0 = no override)
 
-    Path 1 — vocab_hash is computable (data files present):
-      1. Compute/verify ckpt_hash
-      2. Read/write current_checkpoint.json
-      3. Verify/fix cache_lock.json in checkpoint dir
-      4. Verify cache files exist, return paths
-
-    Path 2 — vocab_hash not computable (data files missing):
-      1. Read ckpt_hash from current_checkpoint.json
-      2. Verify checkpoint dir exists, else error
-      3. Read cache_lock.json from checkpoint dir
-      4. Verify cache files exist, else error
+    Returns:
+        dict with keys:
+            config: the resolved config dict
+            config_path: path to the config file being used
+            ckpt_hash: the checkpoint hash string (or None)
+            update_default: whether to update the default config during training
     """
-    import sys
     from pathlib import Path
 
-    ckpt_root = Path(ckpt_dir)
-    cache_root = Path(cache_dir)
+    with open(config_path, "r") as f:
+        default_config = json.load(f)
+    default_checkpoint_dir = default_config.get("paths", {}).get("checkpoint_dir")
+    update_default = True
+    ckpt_hash = None
 
-    if vocab_hash is not None:
-        # --- PATH 1: data present, can compute hashes ---
-        actual_ckpt = ckpt_hash if ckpt_hash else ""
-        if not actual_ckpt:
-            # Can't proceed without ckpt_hash
-            return {}
-
-        # Check/fix current_checkpoint.json
-        current = read_current_checkpoint(str(ckpt_root))
-        if current is None or current.get("ckpt_hash") != actual_ckpt:
-            write_current_checkpoint(str(ckpt_root), actual_ckpt)
-
-        # Check/fix cache_lock.json in checkpoint dir
-        ckpt_base = ckpt_root / actual_ckpt
-        if not ckpt_base.exists():
-            # No checkpoint yet, fresh start
-            return {
-                "ckpt_hash": actual_ckpt,
-                "vocab_cache": None,
-                "data_cache": None,
-                "resume_info": None,
-                "start_epoch": 0,
-                "global_batch": 0,
-            }
-
-        lock = read_cache_lock(str(ckpt_base))
-        if lock is None:
-            # Cache lock missing — can't resolve from lock alone
-            # Fall back to hash-based lookup
-            vc = _find_cache_by_hash(cache_root, vocab_conf_h, corpus_conf_h, vocab_hash, corpus_h)
-            if vc:
-                vocab_path, data_path = vc
-                write_cache_lock(str(ckpt_base), vocab_path.name, data_path.name)
-                vocab_cache = vocab_path
-                data_cache = data_path
-            else:
-                return {
-                    "ckpt_hash": actual_ckpt,
-                    "vocab_cache": None,
-                    "data_cache": None,
-                    "resume_info": None,
-                    "start_epoch": 0,
-                    "global_batch": 0,
-                }
+    if checkpoint_hash or checkpoint_path:
+        if checkpoint_path:
+            ckpt_dir = Path(checkpoint_path)
         else:
-            vocab_cache = cache_root / lock["vocab_cache"]
-            data_cache = cache_root / lock["data_cache"]
-            # Verify files exist
-            if not vocab_cache.exists() or vocab_cache.stat().st_size <= 0:
-                return {
-                    "ckpt_hash": actual_ckpt,
-                    "vocab_cache": None,
-                    "data_cache": None,
-                    "resume_info": None,
-                    "start_epoch": 0,
-                    "global_batch": 0,
-                }
-            if not data_cache.exists() or data_cache.stat().st_size <= 1_000_000_000:
-                return {
-                    "ckpt_hash": actual_ckpt,
-                    "vocab_cache": str(vocab_cache),
-                    "data_cache": None,
-                    "resume_info": None,
-                    "start_epoch": 0,
-                    "global_batch": 0,
-                }
+            if not default_checkpoint_dir:
+                print("[ERROR] --checkpoint-hash requires checkpoint_dir in config paths.", flush=True)
+                sys.exit(1)
+            ckpt_dir = Path(default_checkpoint_dir) / checkpoint_hash
 
-        # Resume info
-        start_epoch = 0
-        global_batch = 0
-        resume_info = None
-        ckpt = find_latest_checkpoint(str(ckpt_root), actual_ckpt)
-        if ckpt:
-            ep, info, _ = ckpt
-            start_epoch = ep
-            global_batch = int(info.get("global_batch", 0))
-            resume_info = info
+        if not ckpt_dir.is_dir():
+            print(f"[ERROR] Checkpoint directory does not exist: {ckpt_dir}", flush=True)
+            sys.exit(1)
 
-        return {
-            "ckpt_hash": actual_ckpt,
-            "vocab_cache": vocab_cache,
-            "data_cache": data_cache,
-            "resume_info": resume_info,
-            "start_epoch": start_epoch,
-            "global_batch": global_batch,
+        ckpt_config_path = ckpt_dir / "config.json"
+        if not ckpt_config_path.exists():
+            print(f"[ERROR] No config.json in checkpoint: {ckpt_dir}", flush=True)
+            sys.exit(1)
+
+        with open(ckpt_config_path, "r") as f:
+            full_config = json.load(f)
+
+        # Normalize checkpoint config: combined format stores vocab under model.vocab
+        # but callers expect tokenizer at top-level. Convert model.vocab -> tokenizer.
+        if "model" in full_config and "vocab" in full_config["model"]:
+            full_config["tokenizer"] = full_config["model"].pop("vocab")
+        if "model" in full_config and "_hash" in full_config["model"]:
+            full_config["model"].pop("_hash")
+
+        # Use default config's paths (Wsl vs Windows path style)
+        # The checkpoint config stores platform-specific paths; the default config
+        # has the correct paths for the current environment.
+        if default_config.get("paths"):
+            full_config["paths"] = default_config["paths"]
+
+        hash_to_use = checkpoint_hash if checkpoint_hash else ckpt_dir.name
+        full_config["checkpoint"] = {
+            "ckpt_hash": hash_to_use,
+            "epoch": full_config.get("checkpoint", {}).get("epoch", 0),
+            "loss": full_config.get("checkpoint", {}).get("loss", 0.0)
         }
+        config_path = str(ckpt_config_path)
+        update_default = False
+        ckpt_hash = hash_to_use
+        print(f"Loaded config from checkpoint: {ckpt_config_path}", flush=True)
+        print(f"Checkpoint hash: {hash_to_use}", flush=True)
 
+        # Apply CLI overrides
+        if epochs > 0:
+            full_config.setdefault("training", {})["epochs"] = epochs
+        if save_every > 0:
+            full_config.setdefault("training", {}).setdefault("checkpoint", {})["every_epoch"] = save_every
     else:
-        # --- PATH 2: data missing, can't compute vocab_hash ---
-        current = read_current_checkpoint(str(ckpt_root))
-        if current is None:
-            print("[ERROR] Data files missing and no current_checkpoint.json found. "
-                  "Cannot determine checkpoint.", flush=True)
-            sys.exit(1)
+        full_config = default_config
+        # Apply CLI overrides
+        if epochs > 0:
+            full_config.setdefault("training", {})["epochs"] = epochs
+        if save_every > 0:
+            full_config.setdefault("training", {}).setdefault("checkpoint", {})["every_epoch"] = save_every
 
-        actual_ckpt = current["ckpt_hash"]
-        ckpt_base = ckpt_root / actual_ckpt
-        if not ckpt_base.exists():
-            print(f"[ERROR] Checkpoint '{actual_ckpt}' referenced in current_checkpoint.json "
-                  f"does not exist at {ckpt_base}. "
-                  f"Delete checkpoints/current_checkpoint.json and retry.", flush=True)
-            sys.exit(1)
-
-        lock = read_cache_lock(str(ckpt_base))
-        if lock is None:
-            print(f"[ERROR] cache_lock.json missing in {ckpt_base}. "
-                  f"Cannot locate cache files without data dirs. "
-                  f"Recover cache_lock.json or restore data files to retry via path 1.", flush=True)
-            sys.exit(1)
-
-        vocab_cache = cache_root / lock["vocab_cache"]
-        data_cache = cache_root / lock["data_cache"]
-
-        if not vocab_cache.exists() or vocab_cache.stat().st_size <= 0:
-            print(f"[ERROR] Vocab cache missing: {vocab_cache}. "
-                  f"Recover cache files or restore data files to retry via path 1.", flush=True)
-            sys.exit(1)
-        if not data_cache.exists() or data_cache.stat().st_size <= 1_000_000_000:
-            print(f"[ERROR] Data cache missing or incomplete: {data_cache}. "
-                  f"Recover cache files or restore data files to retry via path 1.", flush=True)
-            sys.exit(1)
-
-        # Resume info
-        start_epoch = 0
-        global_batch = 0
-        resume_info = None
-        ckpt = find_latest_checkpoint(str(ckpt_root), actual_ckpt)
-        if ckpt:
-            ep, info, _ = ckpt
-            start_epoch = ep
-            global_batch = int(info.get("global_batch", 0))
-            resume_info = info
-
-        return {
-            "ckpt_hash": actual_ckpt,
-            "vocab_cache": vocab_cache,
-            "data_cache": data_cache,
-            "resume_info": resume_info,
-            "start_epoch": start_epoch,
-            "global_batch": global_batch,
-        }
-
-
-def _find_cache_by_hash(cache_dir, vocab_conf_h, corpus_conf_h, vocab_hash, corpus_h):
-    """Helper: find cache files by full hash match."""
-    return _try_conf_cache(cache_dir, vocab_conf_h, corpus_conf_h, vocab_hash, corpus_h)
+    return {
+        "config": full_config,
+        "config_path": config_path,
+        "ckpt_hash": ckpt_hash,
+        "update_default": update_default,
+    }
 
 
 def train():
+    import argparse
+    parser = argparse.ArgumentParser(description="Train GPT-Mini")
+    parser.add_argument("config", nargs="?", default="gpt_train.json",
+                        help="Path to config file (default: gpt_train.json)")
+    parser.add_argument("--checkpoint-hash", "-CkptHash", "-CheckpointHash",
+                        metavar="HASH", default=None,
+                        help="Resume from checkpoint <checkpoint_dir>/<HASH>")
+    parser.add_argument("--checkpoint-path", "-CkptPath", "-CheckpointPath",
+                        metavar="PATH", default=None,
+                        help="Resume from checkpoint at given path")
+    args, remaining = parser.parse_known_args()
+
+    # Resolve checkpoint config
+    resolved = resolve_checkpoint_config(
+        args.config,
+        checkpoint_hash=args.checkpoint_hash,
+        checkpoint_path=args.checkpoint_path,
+    )
+    full_config = resolved["config"]
+    config_path = resolved["config_path"]
+    update_default_config = resolved["update_default"]
+
     print(f"Python: {sys.executable}")
 
     # Check if running in DDP mode
     in_ddp = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     local_rank = setup_ddp() if in_ddp else 0
-
-    # Load config - supports both combined and split formats
-    config_path = "gpt_train.json"
-    if len(sys.argv) > 1:
-        config_path = sys.argv[1]
-    with open(config_path, "r") as f:
-        full_config = json.load(f)
 
     # Extract model_config and training_config from combined format
     if "model" in full_config and "training" in full_config:
@@ -1421,6 +1321,10 @@ def train():
 
     # Canonical checkpoint hash — derived from actual model tensor dims
     ckpt_hash = get_model_hash(model, vocab_hash)
+    # When resuming from checkpoint config, use the checkpoint's hash
+    config_ckpt = full_config.get("checkpoint", {})
+    if config_ckpt.get("ckpt_hash"):
+        ckpt_hash = config_ckpt["ckpt_hash"]
     if is_main:
         print(f"Checkpoint hash: {ckpt_hash}", flush=True)
 
@@ -1434,12 +1338,12 @@ def train():
 
     # Write cache_lock.json at training start (rank 0)
     # Also write checkpoint pointer into config file (only for default config)
-    is_default_config = (os.path.basename(config_path) == "gpt_train.json")
+    update_default_config = (os.path.basename(config_path) == "gpt_train.json")
     if is_main:
         ckpt_base_dir = Path(paths["checkpoint_dir"]) / ckpt_hash
         ckpt_base_dir.mkdir(parents=True, exist_ok=True)
         write_cache_lock(str(ckpt_base_dir), vocab_cache.name, data_cache.name)
-        if is_default_config:
+        if update_default_config:
             # Write checkpoint pointer into config file
             full_config["checkpoint"] = {"ckpt_hash": ckpt_hash, "epoch": 0, "loss": 0.0}
             with open(config_path, "w", encoding="utf-8") as f:
@@ -1478,7 +1382,7 @@ def train():
         if not model_path.exists():
             model_path = ckpt_path / "model.pth"
         if model_path.exists():
-            ckpt_state = torch.load(str(model_path), map_location=DEVICE)
+            ckpt_state = torch.load(str(model_path), map_location=DEVICE, weights_only=True)
             unwrapped_model.load_state_dict(ckpt_state)
         # Only main rank loads optimizer state (each rank has its own optimizer)
         if is_main:
@@ -1488,7 +1392,7 @@ def train():
             if not optim_path.exists():
                 optim_path = ckpt_path / "optimizer.pt"
             if optim_path.exists():
-                optim_state = torch.load(str(optim_path), map_location=DEVICE)
+                optim_state = torch.load(str(optim_path), map_location=DEVICE, weights_only=True)
                 print(f"  Loaded optimizer state ({optim_path.stat().st_size // 1_000_000}MB)", flush=True)
 
     optimizer = torch.optim.Adam(unwrapped_model.parameters(), lr=train_cfg["lr"])
@@ -1602,7 +1506,7 @@ def train():
                                                    "dataset_samples": len(dataset)},
                                              vocab_cache_name=vocab_cache.name,
                                              data_cache_name=data_cache.name)
-                        if is_default_config:
+                        if update_default_config:
                             _update_config_checkpoint(config_path, full_config, ckpt_hash, epoch, avg)
                     if dist.is_initialized():
                         dist.barrier()
@@ -1633,7 +1537,7 @@ def train():
                                             "dataset_samples": len(dataset)},
                                     vocab_cache_name=vocab_cache.name,
                                     data_cache_name=data_cache.name)
-                    if is_default_config:
+                    if update_default_config:
                         _update_config_checkpoint(config_path, full_config, ckpt_hash, epoch, avg_loss)
                 if dist.is_initialized():
                     dist.barrier()
