@@ -50,7 +50,7 @@ def ddp_setup(rank: int, world_size: int, device: int, master_port: str):
     try:
         _current_backend = backend
         if backend == "nccl":
-            dist.init_process_group(backend=backend, rank=rank, world_size=world_size, device_ids=[device])
+            dist.init_process_group(backend=backend, rank=rank, world_size=world_size, device_id=device)
         else:
             dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
     except RuntimeError as e:
