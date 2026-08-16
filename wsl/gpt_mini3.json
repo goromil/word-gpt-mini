@@ -47,7 +47,7 @@
   "paths": {
     "data_dir": "/mnt/e/training/data",
     "download_dir": "/mnt/e/training/dataset_dl/downloads",
-    "checkpoint_dir": "/home/george/checkpoints",
+    "checkpoint_dir": "/mnt/e/training/checkpoints",
     "cache_dir": "/mnt/e/training/cache"
   }
 }

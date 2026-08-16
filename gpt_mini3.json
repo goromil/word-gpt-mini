@@ -49,10 +49,5 @@
     "download_dir": "E:\\training\\dataset_dl\\downloads",
     "checkpoint_dir": "E:\\training\\checkpoints",
     "cache_dir": "E:\\training\\cache"
-  },
-  "checkpoint": {
-    "ckpt_hash": "ca3a8182d56d8845",
-    "epoch": 0,
-    "loss": 0.0
   }
 }
