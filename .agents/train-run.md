@@ -1,4 +1,4 @@
-﻿# Training Lifecycle Manager
+# Training Lifecycle Manager
 
 ## Description
 Manages the full training lifecycle: pre-flight checks, cache building, trainer selection, launch, monitoring, and resume.
@@ -10,8 +10,8 @@ Manages the full training lifecycle: pre-flight checks, cache building, trainer 
 
 ### Step 1 — Verify config exists and is valid
 ```bash
-python -m py_compile train_gpt.json  # not needed, it's JSON
-python -c "import json; json.load(open('train_gpt.json'))"  # validate
+python -m py_compile gpt_train.json  # not needed, it's JSON
+python -c "import json; json.load(open('gpt_train.json'))"  # validate
 ```
 If missing or broken, suggest `python train_designer.py --no-interact --force` to regenerate.
 
@@ -26,36 +26,36 @@ Get-ChildItem "E:\training\cache" -Filter "data-*.npy" | Select-Object Name, Len
 
 ### Step 3 — Build cache if needed
 ```bash
-python train_noipc_ddp.py --ensure-cache-only
+python noipc_ddp_train.py --ensure-cache-only
 ```
 Or for IPC systems:
 ```bash
-python train_ipc_ddp.py --ensure-cache-only
+python ipc_ddp_train.py --ensure-cache-only
 ```
 This calls `ensure_cache_ready()` which builds vocab + data cache if missing.
 
 ### Step 4 — Select trainer
 | GPU Topology | Trainer | Reason |
 |---|---|---|
-| RTX 3090 / PCIe bridge (PXB) | `train_noipc_ddp.py` | No P2P, CPU grad sync |
-| V100 SXM2 / A100 / H100 (NVLink) | `train_ipc_ddp.py` | Full DDP GPU all_reduce |
+| RTX 3090 / PCIe bridge (PXB) | `noipc_ddp_train.py` | No P2P, CPU grad sync |
+| V100 SXM2 / A100 / H100 (NVLink) | `ipc_ddp_train.py` | Full DDP GPU all_reduce |
 | Windows, any GPU (experimental) | `experimental/train_rpc.py` | TCP sockets, no DDP |
 
-**Default choice:** `train_noipc_ddp.py` (RTX 3090s in this project).
+**Default choice:** `noipc_ddp_train.py` (RTX 3090s in this project).
 
 ### Step 5 — Launch training
 ```bash
 # Standard multi-GPU launch
-python train_noipc_ddp.py -d 0,1
+python noipc_ddp_train.py -d 0,1
 
 # Custom config, single GPU
-python train_noipc_ddp.py -d 0 train_gpt.json
+python noipc_ddp_train.py -d 0 gpt_train.json
 
 # Override epochs
-python train_noipc_ddp.py -d 0,1 --epochs 20
+python noipc_ddp_train.py -d 0,1 --epochs 20
 
 # Force cache rebuild before training
-python train_noipc_ddp.py -d 0,1 --force-cache
+python noipc_ddp_train.py -d 0,1 --force-cache
 ```
 
 ### Step 6 — Monitor training
@@ -75,7 +75,7 @@ Get-Content "$ckpt_dir\$latest\resume.json"
 ### Step 7 — Resume (automatic, no extra action)
 Trainer auto-resumes from latest checkpoint. Just re-run the same command:
 ```bash
-python train_noipc_ddp.py -d 0,1
+python noipc_ddp_train.py -d 0,1
 ```
 It reads `resume.json`, finds latest `model.{slot}.pth`, and continues from `global_batch`.
 
@@ -90,9 +90,9 @@ After force-kill, next launch will resume from last saved checkpoint (not curren
 ## Key Files
 | File | Purpose |
 |------|---------|
-| `train_gpt.json` | Working config with model/training/tokenizer/paths |
-| `train_noipc_ddp.py` | CPU-sync trainer (RTX 3090) |
-| `train_ipc_ddp.py` | Full DDP trainer (NVLink) |
+| `gpt_train.json` | Working config with model/training/tokenizer/paths |
+| `noipc_ddp_train.py` | CPU-sync trainer (RTX 3090) |
+| `ipc_ddp_train.py` | Full DDP trainer (NVLink) |
 | `experimental/train_rpc.py` | TCP-sync trainer (experimental) |
 | `E:\training\cache\` | Cached vocab and dataset |
 | `E:\training\checkpoints\` | Checkpoint directory |
@@ -100,7 +100,7 @@ After force-kill, next launch will resume from last saved checkpoint (not curren
 ## Common Issues
 | Symptom | Fix |
 |---------|-----|
-| Segfault (0xC0000005) | Switch from `train_ipc_ddp.py` to `train_noipc_ddp.py` |
+| Segfault (0xC0000005) | Switch from `ipc_ddp_train.py` to `noipc_ddp_train.py` |
 | OOM at startup | Reduce `batch_size` or `seq_length` in config |
 | "Cache incomplete" warning | Trainer builds cache automatically; wait |
 | Loss stuck at 5.0+ | Check `lr` is non-zero, verify dataset isn't all `<pad>` |

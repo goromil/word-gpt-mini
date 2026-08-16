@@ -1,4 +1,4 @@
-﻿# Cache & Checkpoint Schema
+# Cache & Checkpoint Schema
 
 ## Overview
 
@@ -403,7 +403,7 @@ via the new hash.
 
 ---
 
-## Functions (all in `train_gpt.py`)
+## Functions (all in `gpt_train.py`)
 
 | Function | Signature | Public? |
 |----------|-----------|---------|
@@ -427,7 +427,7 @@ via the new hash.
 
 ## Design Principles
 
-1. **Single source of truth** — Each hash function is defined once in `train_gpt.py`. DDP scripts import it; they do not compute their own hash.
+1. **Single source of truth** — Each hash function is defined once in `gpt_train.py`. DDP scripts import it; they do not compute their own hash.
 2. **Model-first** — `ckpt_hash` reads from the instantiated model object, not from a config dict, guaranteeing the hash matches the actual tensor shapes.
 3. **Vocabulary-bound checkpoints** — `vocab_hash` is embedded in `ckpt_hash`; different vocabularies can never share or collide on checkpoints.
 4. **Content-based invalidation** — `vocab_hash` uses cheap file metadata (name, size, tier, sample cap) without mtime. `corpus_h` samples actual content at 16 evenly-spaced locations for stability across copies while catching real changes.

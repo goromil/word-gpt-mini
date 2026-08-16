@@ -1,4 +1,4 @@
-﻿# Experiment Tracking
+# Experiment Tracking
 
 ## Description
 Manages experiment sessions: creating session notes, tracking changes, comparing results across runs.
@@ -28,7 +28,7 @@ Create `session-ses_{timestamp}.md` with:
 
 ## Config
 ```json
-{ paste train_gpt.json here }
+{ paste gpt_train.json here }
 ```
 
 ## Results
@@ -82,7 +82,7 @@ Files follow pattern `session-ses_{hex_id}.md`:
 ### Key fields to track per session
 | Field | Source |
 |-------|--------|
-| Config changes | `git diff train_gpt.json` |
+| Config changes | `git diff gpt_train.json` |
 | Corpus changes | `compute_corpus_hash` output |
 | Vocab hash | `get_vocab_hash` output |
 | Checkpoint hash | `get_model_hash` output |

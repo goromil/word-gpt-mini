@@ -1,6 +1,6 @@
-﻿import json, math, sys
+import json, math, sys
 
-def calc_params(config_path="train_gpt.json"):
+def calc_params(config_path="gpt_train.json"):
     with open(config_path) as f:
         cfg = json.load(f)
 
@@ -84,5 +84,5 @@ def calc_params(config_path="train_gpt.json"):
     return total
 
 if __name__ == "__main__":
-    path = sys.argv[1] if len(sys.argv) > 1 else "train_gpt.json"
+    path = sys.argv[1] if len(sys.argv) > 1 else "gpt_train.json"
     calc_params(path)

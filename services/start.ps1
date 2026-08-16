@@ -1,10 +1,10 @@
-﻿# Run training on Windows natively (conda env: ai)
+# Run training on Windows natively (conda env: ai)
 # Called by Task Scheduler (SYSTEM account)
 
 $ErrorActionPreference = "Stop"
 
 $PROJECT_DIR = "C:\Users\george\source\ai\word-gpt-mini"
-$CONFIG = "$PROJECT_DIR\train_gpt.json"
+$CONFIG = "$PROJECT_DIR\gpt_train.json"
 $LOG_DIR = "E:\training\logs"
 $LOG_FILE = "$LOG_DIR\train_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
 
@@ -17,7 +17,7 @@ if (-not (Test-Path $LOG_DIR)) {
 "Log:    $LOG_FILE" | Add-Content $LOG_FILE
 "---" | Add-Content $LOG_FILE
 
-conda run -n ai --no-capture-output -p $PROJECT_DIR python train_noipc_ddp.py $CONFIG *>> $LOG_FILE
+conda run -n ai --no-capture-output -p $PROJECT_DIR python noipc_ddp_train.py $CONFIG *>> $LOG_FILE
 $exitCode = $LASTEXITCODE
 
 "---" | Add-Content $LOG_FILE

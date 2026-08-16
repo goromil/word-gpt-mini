@@ -1,4 +1,4 @@
-﻿# Code Development
+# Code Development
 
 ## Description
 Guides code changes: architecture modifications, new features, bug fixes, refactoring, and test updates.
@@ -10,7 +10,7 @@ Guides code changes: architecture modifications, new features, bug fixes, refact
 
 ### Step 1 — Understand the architecture
 
-#### Core modules in `train_gpt.py`
+#### Core modules in `gpt_train.py`
 | Section | Line Range | Classes/Functions |
 |---------|-----------|-------------------|
 | Config | 20-30 | `load_config()`, `config_hash()` |
@@ -28,21 +28,21 @@ Guides code changes: architecture modifications, new features, bug fixes, refact
 #### Trainer scripts
 | Script | GPU Sync | Key Differences |
 |--------|----------|-----------------|
-| `train_noipc_ddp.py` | CPU all_reduce (gloo) | Gradients moved to CPU for sync, back to GPU |
-| `train_ipc_ddp.py` | GPU all_reduce (NCCL) | Standard DDP, requires P2P/NVLink |
+| `noipc_ddp_train.py` | CPU all_reduce (gloo) | Gradients moved to CPU for sync, back to GPU |
+| `ipc_ddp_train.py` | GPU all_reduce (NCCL) | Standard DDP, requires P2P/NVLink |
 | `experimental/train_rpc.py` | Raw TCP sockets | No DDP, manual gradient averaging |
 
 ### Step 2 — Rules for modifications
 
 #### Adding a new model component
-1. Define class in `train_gpt.py` model section
+1. Define class in `gpt_train.py` model section
 2. Wire into `GPTMini.__init__()` and `forward()`
 3. Verify parameter count with `calc_params.py`
-4. Add test to `test_train_gpt.py`
+4. Add test to `test_gpt_train.py`
 
 #### Changing config schema
-1. Update `train_gpt.json` with new key
-2. Update `train_gpt_draft.json` for designer defaults
+1. Update `gpt_train.json` with new key
+2. Update `gpt_train_draft.json` for designer defaults
 3. Update `train_designer.py` if it needs to generate the key
 4. Update hash functions if the key affects vocab/corpus/model identity
 
@@ -54,13 +54,13 @@ Guides code changes: architecture modifications, new features, bug fixes, refact
 **Rule:** If the change means old cache would produce wrong results, the hash must change.
 
 #### Adding a new source filter
-1. Add prefix to `tokenizer.sources` and/or `training.sources` in `train_gpt.json`
+1. Add prefix to `tokenizer.sources` and/or `training.sources` in `gpt_train.json`
 2. Ensure corpus file name starts with that prefix (e.g., `"mydata"` matches `mydata_v1.txt`)
 3. Create `.meta.json` with tier assignment
 
 ### Step 3 — Test coverage
 
-#### Unit tests (`test_train_gpt.py`)
+#### Unit tests (`test_gpt_train.py`)
 | Category | Tests | What they verify |
 |----------|-------|-----------------|
 | Tokenizer | 11 | BPE train, encode, decode, save/load |
@@ -75,7 +75,7 @@ Guides code changes: architecture modifications, new features, bug fixes, refact
 #### Running tests
 ```bash
 # Full suite (requires torch + sentencepiece)
-wsl /home/george/miniconda3/envs/ai/bin/python /mnt/c/Users/gorom/source/ai/word-gpt-mini/test_train_gpt.py
+wsl /home/george/miniconda3/envs/ai/bin/python /mnt/c/Users/gorom/source/ai/word-gpt-mini/test_gpt_train.py
 
 # Syntax check only (no deps needed)
 Get-ChildItem -Recurse -Filter "*.py" | ForEach-Object { python -m py_compile $_.FullName }
@@ -83,10 +83,10 @@ Get-ChildItem -Recurse -Filter "*.py" | ForEach-Object { python -m py_compile $_
 
 ### Step 4 — Validation checklist before commit
 1. [ ] All `.py` files compile (`python -m py_compile`)
-2. [ ] `test_train_gpt.py` passes (71/71)
+2. [ ] `test_gpt_train.py` passes (71/71)
 3. [ ] No legacy references (`ensure_corpus`, `BPETokenizerLegacy`, inline `_corpus_hash`)
 4. [ ] Hash functions produce stable results
-5. [ ] Config validates: `python -c "import json; json.load(open('train_gpt.json'))"`
+5. [ ] Config validates: `python -c "import json; json.load(open('gpt_train.json'))"`
 
 ### Step 5 — Documentation updates
 When changing public APIs or config schema, update:

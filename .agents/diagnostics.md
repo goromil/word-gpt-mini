@@ -1,4 +1,4 @@
-﻿# Model & Training Debugger
+# Model & Training Debugger
 
 ## Description
 Diagnoses training problems: loss anomalies, crashes, OOM errors, gradient issues, and hardware compatibility.
@@ -49,7 +49,7 @@ If stuck:
 ```bash
 python -c "
 import numpy as np, json
-cfg = json.load(open('train_gpt.json'))
+cfg = json.load(open('gpt_train.json'))
 d = np.load(cfg['paths']['cache_dir'] + '/data-*.npy')
 print(f'Unique tokens: {len(np.unique(d))}')
 print(f'Zeros (pad): {(d == 0).sum() / d.size * 100:.1f}%')
@@ -77,14 +77,14 @@ Quick fixes (in order of impact):
 
 #### Segfault (0xC0000005) on startup
 **Root cause:** CUDA IPC on PXB/PCIe-bridge GPUs.
-**Fix:** Switch from `train_ipc_ddp.py` to `train_noipc_ddp.py`.
+**Fix:** Switch from `ipc_ddp_train.py` to `noipc_ddp_train.py`.
 
 ```bash
 # Wrong (will segfault on RTX 3090):
-python train_ipc_ddp.py -d 0,1
+python ipc_ddp_train.py -d 0,1
 
 # Correct for RTX 3090:
-python train_noipc_ddp.py -d 0,1
+python noipc_ddp_train.py -d 0,1
 ```
 
 #### Gradient sync failures
@@ -103,13 +103,13 @@ Trainer uses `127.0.0.1:29500` as master address on Windows.
 ### Step 3 — Verify model architecture
 ```bash
 # Check parameter count
-python calc_params.py train_gpt.json
+python calc_params.py gpt_train.json
 
 # Verify model loads
 python -c "
 import json, torch
-from train_gpt import GPTMini
-cfg = json.load(open('train_gpt.json'))
+from gpt_train import GPTMini
+cfg = json.load(open('gpt_train.json'))
 model_cfg = dict(cfg['model'])
 model_cfg.pop('tokenizer', None)
 model = GPTMini(model_cfg, 65536)
@@ -123,14 +123,14 @@ print(f'Seq len: {model_cfg[\"seq_length\"]}')
 
 ### Step 4 — Run validation tests
 ```bash
-python test_train_gpt.py
+python test_gpt_train.py
 ```
 Expected: 71/71 pass, 0 fail.
 
 ## Diagnostic Checklist
 | Symptom | First Check | Likely Fix |
 |---------|-------------|-----------|
-| Segfault on launch | GPU topology | Switch to `train_noipc_ddp.py` |
+| Segfault on launch | GPU topology | Switch to `noipc_ddp_train.py` |
 | OOM at batch N | `seq_length`, `batch_size` | Reduce one, keep other |
 | NaN loss after epoch K | `lr` too high | Halve `lr`, resume |
 | Loss stuck at start | Dataset content | Rebuild cache, check for corrupt data |

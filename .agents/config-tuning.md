@@ -1,4 +1,4 @@
-﻿# Architecture & Hyperparameter Design
+# Architecture & Hyperparameter Design
 
 ## Description
 Designs and tunes model architecture: layer/head/dim sizing, GPU memory fitting, Chinchilla scaling, and config generation.
@@ -11,12 +11,12 @@ Designs and tunes model architecture: layer/head/dim sizing, GPU memory fitting,
 ### Step 1 — Current config analysis
 ```bash
 # Parameter count
-python calc_params.py train_gpt.json
+python calc_params.py gpt_train.json
 
 # Current config
 python -c "
 import json
-cfg = json.load(open('train_gpt.json'))
+cfg = json.load(open('gpt_train.json'))
 m = cfg['model']
 n_embd = m['n_head'] * m['head_dim']
 print(f'Architecture: {m[\"n_layer\"]}L / {m[\"n_head\"]}H / hd={m[\"head_dim\"]}')
@@ -124,16 +124,16 @@ For current config (36L/20H/hd=64 ≈ 126M params):
 ### Step 8 — Validate changes
 ```bash
 # Verify config is valid JSON
-python -c "import json; json.load(open('train_gpt.json'))"
+python -c "import json; json.load(open('gpt_train.json'))"
 
 # Check parameter count matches expectation
-python calc_params.py train_gpt.json
+python calc_params.py gpt_train.json
 
 # Verify hash stability
 python -c "
-from train_gpt import get_vocab_hash
+from gpt_train import get_vocab_hash
 import json
-cfg = json.load(open('train_gpt.json'))
+cfg = json.load(open('gpt_train.json'))
 h = get_vocab_hash(cfg['tokenizer'], [cfg['paths']['data_dir']])
 print(f'vocab_hash: {h}')
 "

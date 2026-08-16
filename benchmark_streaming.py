@@ -1,4 +1,4 @@
-﻿"""Benchmark suite for streaming corpus/vocab/dataset pipeline.
+"""Benchmark suite for streaming corpus/vocab/dataset pipeline.
 
 Measures:
   1. Hash computation speed (vocab_hash, corpus_hash)
@@ -23,7 +23,7 @@ import os
 from pathlib import Path
 from dataclasses import dataclass, field
 
-import train_gpt
+import gpt_train
 
 
 # ---------------------------------------------------------------------------
@@ -56,7 +56,7 @@ def run_bench(name, fn):
 
 
 def load_config():
-    with open("train_gpt.json", "r") as f:
+    with open("gpt_train.json", "r") as f:
         return json.load(f)
 
 
@@ -98,7 +98,7 @@ def bench_vocab_hash():
         data_dirs.extend(paths["extra_data_dirs"])
 
     # Warm-up
-    h = train_gpt.get_vocab_hash(vocab_cfg, data_dirs)
+    h = gpt_train.get_vocab_hash(vocab_cfg, data_dirs)
     print(f"  vocab_hash: {h}")
 
     # Timed runs
@@ -106,7 +106,7 @@ def bench_vocab_hash():
     times = []
     for _ in range(N):
         t0 = time.perf_counter()
-        h2 = train_gpt.get_vocab_hash(vocab_cfg, data_dirs)
+        h2 = gpt_train.get_vocab_hash(vocab_cfg, data_dirs)
         times.append(time.perf_counter() - t0)
         assert h == h2, "Hash not stable!"
 
@@ -125,7 +125,7 @@ def bench_corpus_hash():
         data_dirs.extend(paths["extra_data_dirs"])
 
     # Warm-up
-    h = train_gpt.compute_corpus_hash(data_dirs)
+    h = gpt_train.compute_corpus_hash(data_dirs)
     print(f"  corpus_hash: {h}")
 
     # Timed runs
@@ -133,7 +133,7 @@ def bench_corpus_hash():
     times = []
     for _ in range(N):
         t0 = time.perf_counter()
-        h2 = train_gpt.compute_corpus_hash(data_dirs)
+        h2 = gpt_train.compute_corpus_hash(data_dirs)
         times.append(time.perf_counter() - t0)
         assert h == h2, "Hash not stable!"
 
@@ -168,8 +168,8 @@ def bench_conf_hashes():
     training_sources = config.get("training", {}).get("sources")
 
     # Warm-up
-    vc_h = train_gpt.get_vocab_conf_hash(vocab_cfg, tokenizer_sources)
-    cp_h = train_gpt.get_corpus_conf_hash(training_sources)
+    vc_h = gpt_train.get_vocab_conf_hash(vocab_cfg, tokenizer_sources)
+    cp_h = gpt_train.get_corpus_conf_hash(training_sources)
     print(f"  vocab_conf_hash: {vc_h}")
     print(f"  corpus_conf_hash: {cp_h}")
 
@@ -179,11 +179,11 @@ def bench_conf_hashes():
     cp_times = []
     for _ in range(N):
         t0 = time.perf_counter()
-        train_gpt.get_vocab_conf_hash(vocab_cfg, tokenizer_sources)
+        gpt_train.get_vocab_conf_hash(vocab_cfg, tokenizer_sources)
         vc_times.append(time.perf_counter() - t0)
 
         t0 = time.perf_counter()
-        train_gpt.get_corpus_conf_hash(training_sources)
+        gpt_train.get_corpus_conf_hash(training_sources)
         cp_times.append(time.perf_counter() - t0)
 
     vc_avg = sum(vc_times) / len(vc_times) * 1000
@@ -212,7 +212,7 @@ def bench_iterator_count():
     data_dir = paths["data_dir"]
     extra_dirs = paths.get("extra_data_dirs")
 
-    iter_ = train_gpt.SentenceIterator(data_dir, extra_dirs, sources=sources)
+    iter_ = gpt_train.SentenceIterator(data_dir, extra_dirs, sources=sources)
     total, tier_counts = iter_.count_sentences()
 
     return {
@@ -232,7 +232,7 @@ def bench_iterator_memory():
     extra_dirs = paths.get("extra_data_dirs")
 
     tracemalloc.start()
-    iter_ = train_gpt.SentenceIterator(data_dir, extra_dirs)
+    iter_ = gpt_train.SentenceIterator(data_dir, extra_dirs)
 
     # Snapshot after constructor (should be low — iterators are lazy)
     curr, peak = tracemalloc.get_traced_memory()
@@ -274,7 +274,7 @@ def bench_tokenizer_load():
     N = 5
     times = []
     for _ in range(N):
-        tok = train_gpt.BPETokenizer(
+        tok = gpt_train.BPETokenizer(
             max_vocab_size=vocab_cfg.get("max_vocab_size", 65536),
             max_word_len=vocab_cfg.get("max_word_len", 20),
         )
@@ -304,7 +304,7 @@ def bench_tokenizer_encode():
         print("  SKIP: no cached vocab found")
         return {"status": "skipped"}
 
-    tok = train_gpt.BPETokenizer(
+    tok = gpt_train.BPETokenizer(
         max_vocab_size=vocab_cfg.get("max_vocab_size", 65536),
         max_word_len=vocab_cfg.get("max_word_len", 20),
     )
@@ -372,7 +372,7 @@ def bench_dataset_cache_hit():
     data_file = data_files[-1]
     print(f"  Using: {data_file.name}")
 
-    tok = train_gpt.BPETokenizer(
+    tok = gpt_train.BPETokenizer(
         max_vocab_size=vocab_cfg.get("max_vocab_size", 65536),
         max_word_len=vocab_cfg.get("max_word_len", 20),
     )
@@ -380,7 +380,7 @@ def bench_dataset_cache_hit():
 
     # Load from cache (empty sentences list = cache mode)
     t0 = time.perf_counter()
-    dataset = train_gpt.WordDataset(
+    dataset = gpt_train.WordDataset(
         [], tok, model_cfg["seq_length"], cache_file=str(data_file)
     )
     elapsed = time.perf_counter() - t0
@@ -416,14 +416,14 @@ def bench_end_to_end():
 
     # Phase 1: Hashes
     t0 = time.perf_counter()
-    vh = train_gpt.get_vocab_hash(vocab_cfg, data_dirs)
-    ch = train_gpt.compute_corpus_hash(data_dirs)
+    vh = gpt_train.get_vocab_hash(vocab_cfg, data_dirs)
+    ch = gpt_train.compute_corpus_hash(data_dirs)
     hash_time = time.perf_counter() - t0
 
     # Phase 2: Iterator
     t0 = time.perf_counter()
     sources = vocab_cfg.get("sources")
-    si = train_gpt.SentenceIterator(paths["data_dir"], paths.get("extra_data_dirs"),
+    si = gpt_train.SentenceIterator(paths["data_dir"], paths.get("extra_data_dirs"),
                                      sources=sources)
     total, tier_counts = si.count_sentences()
     iter_time = time.perf_counter() - t0

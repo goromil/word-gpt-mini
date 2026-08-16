@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 train_designer.py — Interactive training config designer
 
@@ -20,7 +20,7 @@ args = [a for a in sys.argv[1:] if a not in FLAGS]
 scan_vocab_flag = "--scan-vocab" in sys.argv
 force = "--force" in sys.argv
 no_interact = "--no-interact" in sys.argv
-draft_path = args[0] if len(args) > 0 else "train_gpt_draft.json"
+draft_path = args[0] if len(args) > 0 else "gpt_train_draft.json"
 
 
 def next_pow2(x):
@@ -154,7 +154,7 @@ def estimate_memory_per_gpu(params, n_heads, n_embd, n_layer, seq_length, bs_per
     #   - Backward: recompute forward per block, store gradients (0.5-0.7x forward)
     #   - Effective: ~20 x n_embd + 2 x n_heads x seq_length per token (checkpointed)
 
-    use_checkpointing = True  # train_gpt.py uses checkpoint_sequential in training
+    use_checkpointing = True  # gpt_train.py uses checkpoint_sequential in training
     if use_checkpointing:
         bytes_per_token = 20 * n_embd + 2 * n_heads * seq_length
         fwd_mult = 1.0   # store block inputs across all layers
@@ -511,7 +511,7 @@ def run(draft_path):
         "paths": paths,
     }
 
-    out_file = "train_gpt.json"
+    out_file = "gpt_train.json"
     if os.path.exists(out_file) and not force and not no_interact:
         print(f"\n  ERROR: {out_file} already exists. Use --force to overwrite.")
         sys.exit(1)
@@ -540,7 +540,7 @@ def run(draft_path):
     print(f"  2. Train on {world_size} GPU(s):")
     print(f"     python train_ddp.py")
     print(f"  3. Or single GPU:")
-    print(f"     python train_gpt.py")
+    print(f"     python gpt_train.py")
     print()
 
 

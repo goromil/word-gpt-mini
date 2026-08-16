@@ -1,9 +1,9 @@
-﻿import json
+import json
 import torch
-from train_gpt import GPTMini, WordTokenizer, WordDataset
+from gpt_train import GPTMini, WordTokenizer, WordDataset
 
 # Load config
-with open("train_gpt.json", "r") as f:
+with open("gpt_train.json", "r") as f:
     config = json.load(f)
 
 model_cfg = dict(config.get("model", {}))

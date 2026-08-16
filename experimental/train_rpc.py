@@ -1,4 +1,4 @@
-﻿"""
+"""
 Multi-GPU trainer — manual gradient sync over TCP, no DDP, no gloo.
 
 Each process runs independently. Gradients are synced via raw TCP sockets
@@ -28,7 +28,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
 
-from train_gpt import (
+from gpt_train import (
     GPTMini, WordTokenizer, WordDataset, SentenceIterator,
     save_checkpoint, find_latest_checkpoint,
     compute_corpus_hash, get_vocab_hash,
@@ -522,7 +522,7 @@ def run():
     parser.add_argument("--port", type=int, default=29500)
     parser.add_argument("--epochs", type=int, default=0)
     parser.add_argument("--save_every", type=int, default=0)
-    parser.add_argument("config", nargs="?", default="train_gpt.json")
+    parser.add_argument("config", nargs="?", default="gpt_train.json")
     parser.add_argument("--cache-renew", action="store_true",
                         help="Force rebuild vocab + data cache")
     args = parser.parse_args()
@@ -558,7 +558,7 @@ def run():
         force=args.cache_renew
     )
 
-    # Checkpoint hash = model params only (matches train_gpt.py's cfg_hash)
+    # Checkpoint hash = model params only (matches gpt_train.py's cfg_hash)
     model_param_dict = {
         "n_layer": model_cfg["n_layer"], "n_head": model_cfg["n_head"],
         "head_dim": model_cfg["head_dim"], "seq_length": model_cfg["seq_length"],
