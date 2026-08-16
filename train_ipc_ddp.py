@@ -692,11 +692,26 @@ def run():
 
     try:
         if world_size == 1:
-            # TODO: single-GPU DDP silently exits after "Starting training..."
-            # Root cause: DDP + dist.init_process_group + gloo for world_size=1 hangs on Windows
-            # Fix: skip DDP wrapper for world_size=1, use regular DataLoader + model (no dist calls)
-            # For now: use gpt_mini3.py directly for single-GPU training
-            run_ddp(0, 1, devices, args.port, args.config, args.epochs, args.save_every)
+            # Single GPU: skip DDP, use gpt_mini3.train() directly (no dist.init_process_group)
+            print(f"Single GPU detected ({devices[0]}), using direct training.", flush=True)
+            # Apply CLI overrides via temp config (don't modify user's config)
+            import tempfile
+            with open(args.config, "r") as f:
+                full_cfg = json.load(f)
+            if args.epochs > 0:
+                full_cfg.setdefault("training", {})["epochs"] = args.epochs
+            if args.save_every > 0:
+                full_cfg.setdefault("training", {}).setdefault("checkpoint", {})["every_epoch"] = args.save_every
+            tmp_cfg = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
+            json.dump(full_cfg, tmp_cfg, indent=2)
+            tmp_cfg.close()
+            try:
+                sys.argv = ["gpt_mini3.py", tmp_cfg.name]
+                from gpt_mini3 import train as run_single_gpu
+                run_single_gpu()
+            finally:
+                os.unlink(tmp_cfg.name)
+            return
         else:
             mp.set_sharing_strategy("file_system")
             mp.spawn(run_ddp,
