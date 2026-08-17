@@ -1354,6 +1354,7 @@ def train():
         ckpt = find_latest_checkpoint(paths["checkpoint_dir"], ckpt_hash)
         if ckpt:
             ep, info, ckpt_path = ckpt
+            start_epoch = ep
             global_batch = int(info.get("global_batch", 0))
             resume_info = info
             print(f"Resuming from {ckpt_path} (epoch {ep}, loss {info['loss']:.6f}, global_batch {global_batch})", flush=True)
