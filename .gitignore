@@ -37,5 +37,9 @@ opencode-session*.md
 *.log
 errors.log
 run_hash.txt
-# All JSON files
+
+# All JSON configs (live in ~/.config/wordgpt/)
 *.json
+
+# Logs directory (created by scheduler)
+logs/
