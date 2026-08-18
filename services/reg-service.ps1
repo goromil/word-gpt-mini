@@ -14,7 +14,7 @@ if ($Type -eq "wsl") {
     $executePath = "C:\Windows\System32\wsl.exe"
     $wslRoot = "/home/$Username/source/ai/word-gpt-mini"
     $logDir = Join-Path $wslRoot "logs"
-    $arguments = "-d Ubuntu-24.04 -u $Username bash -c `"cd $wslRoot; mkdir -p $logDir; bash services/start.sh 1> $logDir/wordgpt.log 2> $logDir/wordgpt-error.log`"
+    $arguments = "-d Ubuntu-24.04 -u $Username bash -c `"cd `"`"$wslRoot`"`"; mkdir -p `"`"$logDir`"`"; bash services/start.sh 1> `"`"$logDir/wordgpt.log`"`" 2> `"`"$logDir/wordgpt-error.log`"`"`""
 }
 else {
     $executePath = "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
