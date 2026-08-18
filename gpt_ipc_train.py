@@ -1,13 +1,13 @@
 """
 Multi-GPU DDP trainer for NVLink/P2P GPUs (requires CUDA IPC).
 Requires P2P topology between GPUs (e.g. V100 SXM2, A100, H100).
-Will NOT work on PCIe-bridge GPUs like RTX 3090 (use noipc_ddp_train.py).
+Will NOT work on PCIe-bridge GPUs like RTX 3090 (use gpt_nipc_train.py).
 
 Usage:
-    python ipc_ddp_train.py                          # all CUDA GPUs, default config
-    python ipc_ddp_train.py -d 0,1                   # GPUs 0 and 1
-    python ipc_ddp_train.py -d 0 gpt_train.json      # GPU 0 only, custom config
-    python ipc_ddp_train.py --epochs 10 --save_every 3
+    python gpt_ipc_train.py                          # all CUDA GPUs, default config
+    python gpt_ipc_train.py -d 0,1                   # GPUs 0 and 1
+    python gpt_ipc_train.py -d 0 gpt_train.json      # GPU 0 only, custom config
+    python gpt_ipc_train.py --epochs 10 --save_every 3
 """
 import os, sys, json, time, hashlib, signal, subprocess
 from pathlib import Path
@@ -58,7 +58,7 @@ def ddp_setup(rank: int, world_size: int, device: int, master_port: str, backend
     print(f"Rank {rank} -> cuda:{device} | {torch.cuda.get_device_name(device)}  "
           f"(world_size={world_size}, backend={backend}, P2P={has_p2p})")
     if not has_p2p:
-        raise RuntimeError(f"No P2P between GPUs! Use noipc_ddp_train.py instead.")
+        raise RuntimeError(f"No P2P between GPUs! Use gpt_nipc_train.py instead.")
 
 
 # =============================================================================
@@ -700,7 +700,7 @@ def run():
         )
         if not has_p2p and not args.force:
             print(f"Error: No P2P access between GPUs {devices}!", flush=True)
-            print(f"  Use 'noipc_ddp_train.py' for non-P2P GPUs (e.g. RTX 3090 PXB topology)", flush=True)
+            print(f"  Use 'gpt_nipc_train.py' for non-P2P GPUs (e.g. RTX 3090 PXB topology)", flush=True)
             print(f"  Or pass --force to override (will likely crash).", flush=True)
             sys.exit(1)
 

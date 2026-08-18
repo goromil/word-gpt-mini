@@ -79,9 +79,9 @@ for i in range(torch.cuda.device_count()):
 ### Trainer selection logic
 ```
 if GPU has P2P (NVLink/SXM2):
-    → ipc_ddp_train.py
+    → gpt_ipc_train.py
 elif GPU is PXB/PCIe bridge (RTX 3090):
-    → noipc_ddp_train.py
+    → gpt_nipc_train.py
 elif Windows, any GPU (experimental):
     → experimental/train_rpc.py
 ```

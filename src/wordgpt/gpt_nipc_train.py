@@ -6,10 +6,10 @@ requires CUDA IPC, which requires P2P between GPUs. Our RTX 3090s have
 PXB topology (no P2P). Fix: sync gradients via CPU where gloo works.
 
 Usage:
-    python noipc_ddp_train.py                          # all CUDA GPUs, default config
-    python noipc_ddp_train.py -d 0,1                   # GPUs 0 and 1
-    python noipc_ddp_train.py -d 0 gpt_train.json      # GPU 0 only, custom config
-    python noipc_ddp_train.py --epochs 10 --save_every 3
+    python gpt_nipc_train.py                          # all CUDA GPUs, default config
+    python gpt_nipc_train.py -d 0,1                   # GPUs 0 and 1
+    python gpt_nipc_train.py -d 0 gpt_train.json      # GPU 0 only, custom config
+    python gpt_nipc_train.py --epochs 10 --save_every 3
 """
 import os, sys, json, time, hashlib, signal, subprocess
 from pathlib import Path
@@ -19,7 +19,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.utils.data import Sampler as DataSampler
 
-from gpt_train import (
+from wordgpt.gpt_train import (
     GPTMini, WordTokenizer, WordDataset, SentenceIterator,
     save_checkpoint, find_latest_checkpoint, generate_text, get_model_hash, get_vocab_hash,
     compute_corpus_hash, get_vocab_conf_hash, get_corpus_conf_hash,
@@ -722,6 +722,8 @@ def _kill_orphans():
 # =============================================================================
 def run():
     import argparse
+    from wordgpt.config import get_default_config_path
+    default_cfg = str(get_default_config_path())
     parser = argparse.ArgumentParser(
         description="Multi-GPU DDP trainer (PyTorch tutorial pattern)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -734,8 +736,8 @@ def run():
                         help="Override training epochs from config.")
     parser.add_argument("--save_every", type=int, default=0,
                         help="Override checkpoint_every from config.")
-    parser.add_argument("config", nargs="?", default="gpt_train.json",
-                        help="Path to config JSON.")
+    parser.add_argument("config", nargs="?", default=default_cfg,
+                        help=f"Path to config JSON (default: {default_cfg})")
     parser.add_argument("--cache-renew", action="store_true",
                         help="Force rebuild vocab + data cache, ignoring any existing cache")
     parser.add_argument("--checkpoint-hash", "-CkptHash", "-CheckpointHash",
@@ -747,7 +749,7 @@ def run():
     args = parser.parse_args()
 
     # Resolve checkpoint config (shared logic from gpt_train)
-    from gpt_train import resolve_checkpoint_config
+    from wordgpt.gpt_train import resolve_checkpoint_config
     resolved = resolve_checkpoint_config(
         args.config,
         checkpoint_hash=args.checkpoint_hash,
@@ -805,7 +807,7 @@ def run():
             print(f"Single GPU detected ({devices[0]}), using direct training.", flush=True)
             try:
                 sys.argv = ["gpt_train.py", tmp_cfg.name]
-                from gpt_train import train as run_single_gpu
+                from wordgpt.gpt_train import train as run_single_gpu
                 run_single_gpu()
             finally:
                 os.unlink(tmp_cfg.name)

@@ -1,15 +1,13 @@
 """
-Multi-GPU trainer with manual CPU gradient sync.
-
-Root cause of DDP crash on Windows: gloo's all_reduce on CUDA tensors
-requires CUDA IPC, which requires P2P between GPUs. Our RTX 3090s have
-PXB topology (no P2P). Fix: sync gradients via CPU where gloo works.
+Multi-GPU DDP trainer for NVLink/P2P GPUs (requires CUDA IPC).
+Requires P2P topology between GPUs (e.g. V100 SXM2, A100, H100).
+Will NOT work on PCIe-bridge GPUs like RTX 3090 (use gpt_nipc_train.py).
 
 Usage:
-    python noipc_ddp_train.py                          # all CUDA GPUs, default config
-    python noipc_ddp_train.py -d 0,1                   # GPUs 0 and 1
-    python noipc_ddp_train.py -d 0 gpt_train.json      # GPU 0 only, custom config
-    python noipc_ddp_train.py --epochs 10 --save_every 3
+    python gpt_ipc_train.py                          # all CUDA GPUs, default config
+    python gpt_ipc_train.py -d 0,1                   # GPUs 0 and 1
+    python gpt_ipc_train.py -d 0 gpt_train.json      # GPU 0 only, custom config
+    python gpt_ipc_train.py --epochs 10 --save_every 3
 """
 import os, sys, json, time, hashlib, signal, subprocess
 from pathlib import Path
@@ -17,7 +15,8 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from torch.utils.data import Sampler as DataSampler
+from torch.utils.data import Sampler
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from wordgpt.gpt_train import (
     GPTMini, WordTokenizer, WordDataset, SentenceIterator,
@@ -30,10 +29,18 @@ from wordgpt.gpt_train import (
 
 
 # =============================================================================
-# 1. DISTRIBUTED SETUP  (gloo for CPU all_reduce only)
+# 1. DDP SETUP  (exactly per PyTorch tutorial)
 # =============================================================================
-def dist_setup(rank: int, world_size: int, device: int, master_port: str, backend: str):
-    """Init process group with pre-resolved backend. No DDP wrapper, no CUDA IPC needed."""
+def ddp_setup(rank: int, world_size: int, device: int, master_port: str, backend: str):
+    """
+    Args:
+        rank:       Unique identifier of each process (0..world_size-1)
+        world_size: Total number of processes
+        device:     Actual CUDA device index this rank maps to
+        master_port: TCP port for rendezvous
+        backend:    Pre-resolved backend string ('nccl' or 'gloo')
+    """
+    # Set device BEFORE init_process_group (prevents hangs / OOM on GPU:0)
     torch.cuda.set_device(device)
 
     os.environ["MASTER_ADDR"] = "localhost"
@@ -44,87 +51,14 @@ def dist_setup(rank: int, world_size: int, device: int, master_port: str, backen
         dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
     except RuntimeError as e:
         if "built in" in str(e):
-            raise RuntimeError(f"Backend '{backend}' not compiled.") from e
+            raise RuntimeError(f"Backend '{backend}' not compiled. Install torch with NCCL support or use gloo.") from e
         raise
 
     has_p2p = torch.cuda.can_device_access_peer(device, (device + 1) % 2)
     print(f"Rank {rank} -> cuda:{device} | {torch.cuda.get_device_name(device)}  "
           f"(world_size={world_size}, backend={backend}, P2P={has_p2p})")
-
-
-# =============================================================================
-# 2. GRADIENT SYNC METHODS  (select via sync.method in config)
-# =============================================================================
-
-def _allreduce_gpu(model):
-    """Direct GPU all_reduce — zero CPU memory.
-    NOTE: crashes with gloo on Windows (gloo lacks CUDA tensor support).
-    Use only with NCCL backend."""
-    for p in model.parameters():
-        if p.grad is not None:
-            dist.all_reduce(p.grad.data, op=dist.ReduceOp.SUM)
-            p.grad.data.div_(dist.get_world_size())
-
-
-def _build_chunked_buffers(model, num_chunks):
-    """Split params into num_chunks groups, each with own pinned CPU buffer."""
-    params = [p for p in model.parameters() if p.requires_grad]
-    dtype = next(model.parameters()).dtype
-
-    total = sum(p.numel() for p in params)
-    chunk_size = total // num_chunks
-    chunks = []
-    idx = 0
-    for i in range(num_chunks):
-        chunk_params = []
-        chunk_elems = 0
-        target = chunk_size if i < num_chunks - 1 else total
-        while idx < len(params) and chunk_elems < target:
-            chunk_params.append(params[idx])
-            chunk_elems += params[idx].numel()
-            idx += 1
-        if chunk_params:
-            chunks.append(chunk_params)
-
-    model._chunk_params = chunks
-    model._chunk_bufs = []
-    for cp in chunks:
-        numel = sum(p.numel() for p in cp)
-        buf = torch.empty(numel, dtype=dtype, device='cpu', pin_memory=True)
-        model._chunk_bufs.append(buf)
-
-
-def _allreduce_chunked(model):
-    """Chunked CPU all_reduce — fully synchronous, one chunk at a time.
-    No pipelining: each chunk completes (copy→reduce→copy-back) before next.
-    Guarantees no race with next batch's backward."""
-    chunks = model._chunk_params
-    bufs = model._chunk_bufs
-
-    for cp, buf in zip(chunks, bufs):
-        grads = [p.grad.data for p in cp]
-        flat = torch._utils._flatten_dense_tensors(grads)
-        buf[:flat.numel()].copy_(flat)  # blocking GPU→CPU
-        dist.all_reduce(buf[:buf.numel()], op=dist.ReduceOp.SUM)
-        buf[:buf.numel()].div_(dist.get_world_size())
-        split = torch._utils._unflatten_dense_tensors(buf[:buf.numel()], grads)
-        for p, g in zip(cp, split):
-            p.grad.data.copy_(g)  # blocking CPU→GPU
-
-    torch.cuda.synchronize()
-
-
-def all_reduce_grads(model, backend: str, sync_method: str):
-    """Dispatch to sync method. Backend and sync_method are pre-resolved."""
-    world_size = dist.get_world_size()
-    if world_size <= 1:
-        return
-    if sync_method == "gpu" and backend != "nccl":
-        raise RuntimeError(f"sync_method='gpu' requires NCCL backend, got '{backend}'")
-    if sync_method == "cpu":
-        _allreduce_chunked(model)
-    else:
-        _allreduce_gpu(model)
+    if not has_p2p:
+        raise RuntimeError(f"No P2P between GPUs! Use gpt_nipc_train.py instead.")
 
 
 # =============================================================================
@@ -176,7 +110,6 @@ def build_tokenizer_and_dataset(rank, world_size, model_cfg, vocab_cfg, train_cf
             print("Loading cached vocab + dataset...", flush=True)
         tokenizer.load(vocab_cache)
     else:
-        # Should not happen — pre-flight ensure_cache_ready should have built it
         missing = []
         if not vocab_ok:
             missing.append(f"vocab: {vocab_cache}")
@@ -223,7 +156,7 @@ def load_train_objs(tokenizer, dataset, model_cfg, device):
 # =============================================================================
 # 3. LAZY DISTRIBUTED SAMPLER  (no randperm, no MemoryError)
 # =============================================================================
-class LazyDistributedSampler(DataSampler):
+class LazyDistributedSampler(Sampler):
     """Yield indices for one rank without materializing a full permutation array."""
     def __init__(self, dataset_len, rank=0, world_size=1, batch_size=1):
         self.dataset_len = dataset_len
@@ -250,7 +183,7 @@ def prepare_dataloader(dataset, batch_size: int, rank: int, world_size: int):
     """
     from torch.utils.data import DataLoader
     sampler = LazyDistributedSampler(len(dataset), rank=rank, world_size=world_size,
-                                     batch_size=batch_size)
+                                      batch_size=batch_size)
     return DataLoader(dataset, batch_size=batch_size, sampler=sampler, drop_last=True,
                       num_workers=0, pin_memory=False), sampler
 
@@ -261,7 +194,7 @@ def prepare_dataloader(dataset, batch_size: int, rank: int, world_size: int):
 class Trainer:
     def __init__(self, model, train_data, sampler, optimizer, rank, world_size,
                   device, model_cfg, train_cfg, paths, ckpt_hash, combined_config,
-                  tokenizer, backend, sync_method, dataset_tokens=0, dataset_samples=0,
+                  tokenizer, unwrapped_model, dataset_tokens=0, dataset_samples=0,
                   vocab_cache_name=None, data_cache_name=None):
         self.model = model
         self.train_data = train_data
@@ -277,6 +210,7 @@ class Trainer:
         self.ckpt_hash = ckpt_hash
         self.combined_config = combined_config
         self.tokenizer = tokenizer
+        self.unwrapped_model = unwrapped_model
         self.dataset_tokens = dataset_tokens
         self.dataset_samples = dataset_samples
         self.vocab_cache_name = vocab_cache_name
@@ -290,9 +224,6 @@ class Trainer:
         sync_cfg = train_cfg.get("sync", {})
         self.grad_accum = sync_cfg.get("gradient_accumulation_steps",
                       train_cfg.get("gradient_accumulation_steps", 1))
-        self.sync_chunks = sync_cfg.get("chunks", 4)
-        self.backend = backend
-        self.sync_method = sync_method
         self.use_bf16 = torch.cuda.is_bf16_supported()
         self.log_interval = train_cfg.get("log_interval", 100)
 
@@ -312,9 +243,9 @@ class Trainer:
             self.err_file = open(ckpt_base / "errors.log", "w", encoding="utf-8")
             self.training_start_time = time.time()
             precision = "bf16" if self.use_bf16 else "fp32"
-            print(f"Precision: {precision}, Grad accumulation: {self.grad_accum}x, Sync: {self.sync_method}", flush=True)
+            print(f"Precision: {precision}, Grad accumulation: {self.grad_accum}x", flush=True)
             print(f"Checkpoint hash: {ckpt_hash}", flush=True)
-            print(f"Training: vocab={self.tokenizer.vocab_size} | tokens={self.dataset_tokens:,} | samples={self.dataset_samples:,} | params={sum(p.numel() for p in self.model.parameters())/1e6:.2f}M", flush=True)
+            print(f"Training: vocab={self.tokenizer.vocab_size} | tokens={self.dataset_tokens:,} | samples={self.dataset_samples:,} | params={sum(p.numel() for p in self.unwrapped_model.parameters())/1e6:.2f}M", flush=True)
             print("Starting training...", flush=True)
 
         # Counters
@@ -325,11 +256,6 @@ class Trainer:
         self.session_num_batches = 0  # never resets — for display
         self.training_samples = 0
         self.last_ckpt_time = time.time()
-
-        # Timing (rank 0 only, logged every log_interval)
-        self.elapsed_fwd_bwd = 0.0
-        self.elapsed_sync = 0.0
-        self.elapsed_data = 0.0
 
         # Resume check (ONLY rank 0)
         self._maybe_resume()
@@ -357,7 +283,7 @@ class Trainer:
         if self.gpu_id == 0:
             print(f"Resuming from {ckpt_dir} (epoch {ep}, loss {info['loss']:.6f}, "
                   f"global_batch {self.global_batch})", flush=True)
-        self.model.load_state_dict(ckpt_state)
+        self.unwrapped_model.load_state_dict(ckpt_state)
         del ckpt_state
         # Restore session counters so avg doesn't reset on resume
         self.session_num_batches = self.global_batch
@@ -378,25 +304,18 @@ class Trainer:
         self.optimizer.zero_grad(set_to_none=True)
 
         for x, y in self.train_data:
-            t0 = time.time()
             try:
                 x, y = x.to(f"cuda:{self.device}"), y.to(f"cuda:{self.device}")
-                t_data = time.time() - t0
 
-                t1 = time.time()
                 with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.use_bf16):
                     _, loss = self.model(x, y)
+
                 loss = loss / self.grad_accum
                 loss.backward()
-                t_fwd = time.time() - t1
 
-                t_sync = 0.0
                 if (self.global_batch + 1) % self.grad_accum == 0:
-                    t2 = time.time()
-                    all_reduce_grads(self.model, self.backend, self.sync_method)
                     self.optimizer.step()
                     self.optimizer.zero_grad(set_to_none=True)
-                    t_sync = time.time() - t2
 
                 actual_loss = loss.item() * self.grad_accum
                 self.total_loss += actual_loss
@@ -406,28 +325,14 @@ class Trainer:
                 self.global_batch += 1
                 self.training_samples += x.size(0)
 
-                # Accumulate timing (rank 0 only)
-                if self.gpu_id == 0:
-                    self.elapsed_data += t_data
-                    self.elapsed_fwd_bwd += t_fwd
-                    self.elapsed_sync += t_sync
-
                 # Progress logging (rank 0 only)
                 if self.gpu_id == 0 and self.global_batch % self.log_interval == 0:
                     sess_avg = self.session_total_loss / max(1, self.session_num_batches)
-                    total_t = self.elapsed_data + self.elapsed_fwd_bwd + self.elapsed_sync
-                    p_data = self.elapsed_data / total_t * 100 if total_t else 0
-                    p_fwd = self.elapsed_fwd_bwd / total_t * 100 if total_t else 0
-                    p_sync = self.elapsed_sync / total_t * 100 if total_t else 0
                     print(f"[{time.strftime('%H:%M:%S')}] Epoch {epoch} | "
                           f"batch {self.global_batch} | loss {actual_loss:.4f} | "
                           f"avg {sess_avg:.4f} | "
-                          f"lr {self.optimizer.param_groups[0]['lr']:.6e} | "
-                          f"time: data={p_data:.0f}% fwd/bwd={p_fwd:.0f}% sync={p_sync:.0f}%",
+                          f"lr {self.optimizer.param_groups[0]['lr']:.6e}",
                           flush=True)
-                    self.elapsed_data = 0.0
-                    self.elapsed_fwd_bwd = 0.0
-                    self.elapsed_sync = 0.0
             except Exception as e:
                 _log_error(self.err_file, f"batch {self.global_batch}: {e}")
                 raise
@@ -451,7 +356,7 @@ class Trainer:
                                       self.training_samples, self.model_cfg["seq_length"],
                                       self.training_start_time)
                         save_checkpoint(epoch, avg, self.combined_config, self.ckpt_hash,
-                                        self.model, self.paths["checkpoint_dir"],
+                                        self.unwrapped_model, self.paths["checkpoint_dir"],
                                         optimizer=self.optimizer,
                                         extra={"global_batch": self.global_batch,
                                                 "batch_size": self.train_cfg["batch_size"],
@@ -464,7 +369,7 @@ class Trainer:
                                         vocab_cache_name=self.vocab_cache_name,
                                         data_cache_name=self.data_cache_name)
                     dist.barrier()
-                    # No need to reload — all_reduce already keeps weights in sync
+                    # No need to reload — DDP all_reduce already keeps weights in sync
                 except Exception as e:
                     _log_error(self.err_file, f"checkpoint batch {self.global_batch}: {e}")
                 self.last_ckpt_time = time.time()
@@ -472,14 +377,14 @@ class Trainer:
                 self.total_loss = 0.0
 
     def _save_checkpoint(self, epoch: int, loss: float):
-        """Save from gpu_id == 0. No reload needed — all_reduce keeps weights synced."""
+        """Save from gpu_id == 0. No reload needed — DDP keeps weights synced."""
         ckpt_dir = Path(self.paths["checkpoint_dir"]) / self.ckpt_hash
         if self.gpu_id == 0:
             _write_status(self.log_file, epoch, self.global_batch, loss,
                           self.training_samples, self.model_cfg["seq_length"],
                           self.training_start_time)
             save_checkpoint(epoch, loss, self.combined_config, self.ckpt_hash,
-                            self.model, self.paths["checkpoint_dir"],
+                            self.unwrapped_model, self.paths["checkpoint_dir"],
                             optimizer=self.optimizer,
                             extra={"global_batch": self.global_batch,
                                     "batch_size": self.train_cfg["batch_size"],
@@ -504,6 +409,11 @@ class Trainer:
                       f"completed | avg_loss {avg_loss:.4f} | "
                       f"global_batch {self.global_batch}",
                       flush=True)
+
+            try:
+                scheduler.step()
+            except Exception as e:
+                _log_error(self.err_file, f"scheduler.step epoch {epoch}: {e}")
 
             # End-of-epoch checkpoint
             if epoch % self.ckpt_every == 0:
@@ -549,9 +459,6 @@ def run_ddp(rank: int, world_size: int, devices: tuple, master_port: str, config
             pass
 
     try:
-        # Use multiple CPU threads for gloo all_reduce (default is 1 — too slow)
-        os.environ.setdefault("OMP_NUM_THREADS", str(max(1, (os.cpu_count() or 8) // 2)))
-
         # Reset CUDA context inherited from parent (fixes Windows 0xC0000005 crash)
         try:
             torch.cuda.set_per_process_memory_fraction(1.0, device)
@@ -559,16 +466,14 @@ def run_ddp(rank: int, world_size: int, devices: tuple, master_port: str, config
         except (RuntimeError, AttributeError):
             pass
 
+        # Resolve backend once, before any dist calls
+        backend = "nccl" if dist.is_nccl_available() else "gloo"
+
+        ddp_setup(rank, world_size, device, master_port, backend=backend)
+        dist_initialized = True
+
         # --- Load config ---
         model_cfg, vocab_cfg, train_cfg, paths = load_config(config_path)
-        sync_cfg = train_cfg.get("sync", {})
-        sync_method = sync_cfg.get("method", "gpu")
-
-        # Resolve backend + sync_method once, before any dist calls
-        backend = "nccl" if dist.is_nccl_available() and sync_method == "gpu" else "gloo"
-
-        dist_setup(rank, world_size, device, master_port, backend=backend)
-        dist_initialized = True
 
         # Override from CLI
         if total_epochs > 0:
@@ -586,24 +491,18 @@ def run_ddp(rank: int, world_size: int, devices: tuple, master_port: str, config
             training_sources=train_cfg.get("sources")
         )
 
-        # --- Prepare dataloader ---
+        # --- Prepare dataloader (per tutorial) ---
         train_data, sampler = prepare_dataloader(dataset, batch_size, rank, world_size)
 
-        # --- Build model (NO DDP wrapper — manual grad sync) ---
+        # --- Build model ---
         model = GPTMini(model_cfg, tokenizer.vocab_size).to(f"cuda:{device}")
 
-        # --- Init sync buffers (cpu method only) ---
-        # sync_cfg = train_cfg.get("sync", {})
-        # sync_method = sync_cfg.get("method", "gpu")
-        if sync_method == "cpu" and world_size > 1:
-            num_chunks = sync_cfg.get("chunks", 4)
-            _build_chunked_buffers(model, num_chunks)
-            if rank == 0:
-                chunk_mem = sum(b.element_size() * b.numel() for b in model._chunk_bufs) / (1024**3)
-                print(f"Sync buffers: {num_chunks} chunks, {chunk_mem:.2f} GB total (pinned CPU)", flush=True)
+        # --- DDP wrap (per tutorial) ---
+        model = DDP(model, device_ids=[device], output_device=device)
 
         # --- Optimizer ---
-        optimizer = torch.optim.Adam(model.parameters(), lr=train_cfg.get("lr", 0.0002))
+        unwrapped_model = model.module
+        optimizer = torch.optim.Adam(unwrapped_model.parameters(), lr=train_cfg.get("lr", 0.0002))
 
         # --- Combined config ---
         combined_config = {"model": model_cfg, "training": train_cfg, "paths": paths}
@@ -613,7 +512,7 @@ def run_ddp(rank: int, world_size: int, devices: tuple, master_port: str, config
         ckpt_hash = get_model_hash(model, vocab_hash)
         trainer = Trainer(model, train_data, sampler, optimizer, rank, world_size,
                             device, model_cfg, train_cfg, paths, ckpt_hash,
-                            combined_config, tokenizer, backend, sync_method,
+                            combined_config, tokenizer, unwrapped_model,
                             dataset_tokens=dataset.token_count,
                             dataset_samples=len(dataset),
                             vocab_cache_name=vocab_cache_name,
@@ -653,7 +552,6 @@ def _get_cuda_device_count() -> int:
     """Get GPU count without initializing CUDA context.
     Uses nvidia-smi to avoid corrupting CUDA context for mp.spawn children."""
     try:
-        import subprocess
         out = subprocess.check_output(
             ["nvidia-smi", "--query-gpu=count", "--format=csv,noheader"],
             stderr=subprocess.DEVNULL, text=True, timeout=10
@@ -738,6 +636,8 @@ def run():
                         help="Override checkpoint_every from config.")
     parser.add_argument("config", nargs="?", default=default_cfg,
                         help=f"Path to config JSON (default: {default_cfg})")
+    parser.add_argument("--force", action="store_true",
+                        help="Ignore P2P check and run anyway (will likely crash on non-P2P GPUs)")
     parser.add_argument("--cache-renew", action="store_true",
                         help="Force rebuild vocab + data cache, ignoring any existing cache")
     parser.add_argument("--checkpoint-hash", "-CkptHash", "-CheckpointHash",
@@ -792,6 +692,19 @@ def run():
         devices = tuple(range(cuda_count))
 
     world_size = len(devices)
+
+    # Pre-flight P2P check (only for multi-GPU)
+    if world_size > 1:
+        has_p2p = all(
+            torch.cuda.can_device_access_peer(d1, d2)
+            for i, d1 in enumerate(devices)
+            for d2 in devices[i + 1:]
+        )
+        if not has_p2p and not args.force:
+            print(f"Error: No P2P access between GPUs {devices}!", flush=True)
+            print(f"  Use 'gpt_nipc_train.py' for non-P2P GPUs (e.g. RTX 3090 PXB topology)", flush=True)
+            print(f"  Or pass --force to override (will likely crash).", flush=True)
+            sys.exit(1)
 
     # Setup PID tracking for children
     pid_file = _get_pid_file()

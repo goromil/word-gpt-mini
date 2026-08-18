@@ -28,8 +28,8 @@ Guides code changes: architecture modifications, new features, bug fixes, refact
 #### Trainer scripts
 | Script | GPU Sync | Key Differences |
 |--------|----------|-----------------|
-| `noipc_ddp_train.py` | CPU all_reduce (gloo) | Gradients moved to CPU for sync, back to GPU |
-| `ipc_ddp_train.py` | GPU all_reduce (NCCL) | Standard DDP, requires P2P/NVLink |
+| `gpt_nipc_train.py` | CPU all_reduce (gloo) | Gradients moved to CPU for sync, back to GPU |
+| `gpt_ipc_train.py` | GPU all_reduce (NCCL) | Standard DDP, requires P2P/NVLink |
 | `experimental/train_rpc.py` | Raw TCP sockets | No DDP, manual gradient averaging |
 
 ### Step 2 — Rules for modifications

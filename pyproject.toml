@@ -16,8 +16,8 @@ dependencies = [
 ]
 
 [project.scripts]
-gpt_nipc_train = "wordgpt.noipc_ddp_train:run"
-gpt_ipc_train = "wordgpt.ipc_ddp_train:run"
+gpt_nipc_train = "wordgpt.gpt_nipc_train:run"
+gpt_ipc_train = "wordgpt.gpt_ipc_train:run"
 gpt_train = "wordgpt.gpt_train:train"
 gpt_dataset_dl = "wordgpt.dataset_dl:main"
 gpt_dataset_cumulative_dl = "wordgpt.dataset_cumulative_dl:main"

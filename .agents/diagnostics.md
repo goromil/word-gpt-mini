@@ -77,14 +77,14 @@ Quick fixes (in order of impact):
 
 #### Segfault (0xC0000005) on startup
 **Root cause:** CUDA IPC on PXB/PCIe-bridge GPUs.
-**Fix:** Switch from `ipc_ddp_train.py` to `noipc_ddp_train.py`.
+**Fix:** Switch from `gpt_ipc_train.py` to `gpt_nipc_train.py`.
 
 ```bash
 # Wrong (will segfault on RTX 3090):
-python ipc_ddp_train.py -d 0,1
+python gpt_ipc_train.py -d 0,1
 
 # Correct for RTX 3090:
-python noipc_ddp_train.py -d 0,1
+python gpt_nipc_train.py -d 0,1
 ```
 
 #### Gradient sync failures
@@ -130,7 +130,7 @@ Expected: 71/71 pass, 0 fail.
 ## Diagnostic Checklist
 | Symptom | First Check | Likely Fix |
 |---------|-------------|-----------|
-| Segfault on launch | GPU topology | Switch to `noipc_ddp_train.py` |
+| Segfault on launch | GPU topology | Switch to `gpt_nipc_train.py` |
 | OOM at batch N | `seq_length`, `batch_size` | Reduce one, keep other |
 | NaN loss after epoch K | `lr` too high | Halve `lr`, resume |
 | Loss stuck at start | Dataset content | Rebuild cache, check for corrupt data |
